@@ -1,5 +1,7 @@
 # dsh-project-deck
 
+[![npm](https://img.shields.io/npm/v/dsh-project-deck.svg)](https://www.npmjs.com/package/dsh-project-deck)
+
 **把你的仓库、目录和半途项目，变成一块看得见进度的甲板。**
 A project deck for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)：项目注册表 + 可视化面板 + 定时微信播报 + 自动发现 + 多机扫描。
 
@@ -29,11 +31,13 @@ python3 backend/deck demo          # 生成 4 个假项目，起面板
 
 ```bash
 # 1. 后端（CLI + 面板 + 定时器）
-./install.sh          # 装到 ~/.project-deck，macOS 下注册 launchd
+npx dsh-project-deck install   2>/dev/null || ./install.sh
+# 或：git clone https://github.com/peng456/dsh-project-deck && cd dsh-project-deck && ./install.sh
 
-# 2. DSH 插件
-dsh plugin --profile desktop add github:peng456/dsh-project-deck
-# 或 Desktop → 插件 → 安装 github:peng456/dsh-project-deck
+# 2. DSH 插件（npm 或 GitHub 二选一）
+dsh plugin --profile desktop add dsh-project-deck
+# dsh plugin --profile desktop add github:peng456/dsh-project-deck
+# 或 Desktop → 插件 → 搜索/安装 dsh-project-deck
 ```
 
 重启 DSH 后左下角出现 📋，**可以拖到页面任意位置**，位置会被记住；点开就是面板。
