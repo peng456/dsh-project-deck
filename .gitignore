@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+# never commit personal state
+*.local.json
+nodes.json
+config.json

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""pagent-node —— 多节点扫描器（在每台机器上运行，把本地项目清单推给协调端）。
+
+  pagent-node scan [--roots ~/Desktop,~] [--depth 1] [--json]
+  pagent-node push --server http://192.168.1.3:9199 --token XXX --id hos
+  pagent-node loop --interval 21600            # 每 6 小时自动 push 一次
+
+配置也可写在 ~/.pagent-node.json：
+  {"server":"http://192.168.1.3:9199","token":"...","id":"hos","roots":["~/"],"depth":1}
+
+只读：不会修改任何项目文件；只上报目录名、标记文件、git 最近提交与时间。
+纯标准库，macOS / Linux / Android(Termux) / Windows 均可运行。
+"""
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser('~')
+CONF = os.path.join(HOME, '.pagent-node.json')
+MARKERS = ['.git', 'package.json', 'pnpm-workspace.yaml', 'pyproject.toml', 'setup.py',
+           'go.mod', 'Cargo.toml', 'AGENTS.md', 'CLAUDE.md', '.dsh-graph', 'README.md']
+SKIP = {'.git', 'node_modules', '.venv', 'venv', '__pycache__', 'Library', 'AppData',
+        'Downloads', '.npm', '.cache', '.Trash', 'dist', 'build', 'target', 'go', 'vendor'}
+MAX_PROJECTS = 400
+
+
+def load_conf():
+    try:
+        return json.load(open(CONF))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def markers_of(path):
+    found, latest = [], 0
+    for m in MARKERS:
+        p = os.path.join(path, m)
+        if os.path.exists(p):
+            found.append(m)
+            if m != '.git':
+                try:
+                    latest = max(latest, os.path.getmtime(p))
+                except OSError:
+                    pass
+    return found, latest
+
+
+def git_info(path):
+    try:
+        r = subprocess.run(['git', '-C', path, 'log', '-1', '--format=%ct%x1f%h%x1f%s'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        ts, sha, subj = r.stdout.strip().split('\x1f', 2)
+        dirty = subprocess.run(['git', '-C', path, 'status', '--porcelain'],
+                               capture_output=True, text=True, timeout=5).stdout
+        return {'ts': int(ts), 'sha': sha, 'subject': subj[:80],
+                'dirty': len([l for l in dirty.splitlines() if l.strip()])}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def scan(roots, depth):
+    projects, seen = [], set()
+    for root in roots:
+        base = os.path.realpath(os.path.expanduser(root))
+        if not os.path.isdir(base):
+            continue
+        level = [(base, 0)]
+        while level:
+            cur, d = level.pop()
+            if d >= depth:
+                continue
+            try:
+                entries = sorted(os.scandir(cur), key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                if not e.is_dir(follow_symlinks=False) or e.name.startswith('.') or e.name in SKIP:
+                    continue
+                sub = os.path.realpath(e.path)
+                if sub in seen:
+                    continue
+                mk, latest = markers_of(sub)
+                if mk:
+                    seen.add(sub)
+                    git = git_info(sub)
+                    projects.append({
+                        'path': sub, 'name': os.path.basename(sub), 'markers': mk,
+                        'git': git, 'last': latest or (git['ts'] if git else 0),
+                    })
+                level.append((sub, d + 1))
+                if len(projects) >= MAX_PROJECTS:
+                    return projects
+    return projects
+
+
+def push(servers, token, node_id, roots, depth):
+    data = {
+        'node': node_id, 'token': token,
+        'platform': platform.system().lower() + ' ' + platform.release(),
+        'scanned_at': time.time(),
+        'projects': scan(roots, depth),
+    }
+    body = json.dumps(data, ensure_ascii=False).encode()
+    last_err = None
+    for server in servers:
+        try:
+            req = urllib.request.Request(server.rstrip('/') + '/api/node-scan', data=body,
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read().decode())
+            print(f"[pagent-node] 上报 {len(data['projects'])} 个项目 → {server} ({res.get('ok')})")
+            return res
+        except Exception as e:
+            last_err = e
+            print(f'[pagent-node] {server} 失败: {e}')
+    raise last_err
+
+
+def in_quiet(conf, ts=None):
+    q = conf.get('quiet') or {}
+    start, end = q.get('from'), q.get('to')
+    if not start or not end:
+        return False
+    hm = time.strftime('%H:%M', time.localtime(ts or time.time()))
+    if start <= end:
+        return start <= hm < end
+    return hm >= start or hm < end
+
+
+def main():
+    conf = load_conf()
+    ap = argparse.ArgumentParser(description='pagent-node 多节点扫描器')
+    ap.add_argument('action', choices=['scan', 'push', 'loop'], nargs='?', default='scan')
+    ap.add_argument('--server', default=conf.get('server', ''))
+    ap.add_argument('--token', default=conf.get('token', ''))
+    ap.add_argument('--id', default=conf.get('id', ''))
+    ap.add_argument('--roots', default=','.join(conf.get('roots', ['~/Desktop', '~'])))
+    ap.add_argument('--depth', type=int, default=int(conf.get('depth', 1)))
+    ap.add_argument('--interval', type=int, default=int(conf.get('interval', 21600)))
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    roots = [r.strip() for r in args.roots.split(',') if r.strip()]
+    if args.action == 'scan':
+        out = scan(roots, args.depth)
+        if args.json:
+            print(json.dumps({'projects': out}, ensure_ascii=False, indent=2))
+        else:
+            for p in out:
+                print(f"{p['markers'][0]:14} {p['path']}")
+            print(f'共 {len(out)} 个项目')
+        return 0
+    if not (args.server and args.token and args.id):
+        print('需要 --server / --token / --id（或写进 ~/.pagent-node.json）')
+        return 1
+    raw_servers = conf.get('servers') or args.server
+    if isinstance(raw_servers, str):
+        servers = [x.strip() for x in raw_servers.split(',') if x.strip()]
+    else:
+        servers = [str(x).strip() for x in raw_servers if str(x).strip()]
+    if args.action == 'push':
+        push(servers, args.token, args.id, roots, args.depth)
+        return 0
+    # loop（安静时段内不推送）
+    quiet = conf.get('quiet') or {}
+    print(f"[pagent-node] 每 {args.interval}s 上报一次"
+          + (f"；安静时段 {quiet.get('from')}–{quiet.get('to')}" if quiet.get('from') else '')
+          + '，Ctrl-C 结束')
+    while True:
+        if in_quiet(conf):
+            time.sleep(60)
+            continue
+        try:
+            push(servers, args.token, args.id, roots, args.depth)
+        except Exception as e:
+            print(f'[pagent-node] 上报失败: {e}')
+        time.sleep(args.interval)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

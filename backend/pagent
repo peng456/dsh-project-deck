@@ -1,0 +1,1500 @@
+#!/usr/bin/env python3
+"""pagent —— 个人 Agent 的项目注册表与微信周期播报。
+
+用法:
+  pagent list                     列出项目
+  pagent preview                  生成播报文本（不发送）
+  pagent report                   立即生成并推送到微信
+  pagent every <小时>             设置播报间隔（可小数，如 0.5 / 4）
+  pagent on | off                 打开 / 关闭周期播报
+  pagent status                   服务与配置状态
+  pagent add <id> --root <path> [--name 名称] [--kind code] [--note 说明]
+  pagent rm <id>                  移除项目
+  pagent scan [--add]             扫描发现新项目；--add 按阈值自动登记
+  pagent image [--no-send|--on|--off]  生成看板图并推送；--on/--off 开关周期附图
+  pagent daemon                   （由 launchd 调用）周期播报守护进程
+"""
+import base64
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+HOME = os.path.expanduser('~')
+BASE = os.path.join(HOME, '.person-agent')
+CONFIG = os.path.join(BASE, 'config.json')
+REGISTRY = os.path.join(BASE, 'registry.json')
+STATE = os.path.join(BASE, 'report-state.json')
+LAST = os.path.join(BASE, 'last-report.txt')
+HISTORY = os.path.join(BASE, 'reports.jsonl')
+CHANNEL_STATE = os.path.join(BASE, 'channel-state.json')
+LOG = os.path.join(BASE, 'logs', 'daemon.log')
+WXSEND = os.environ.get('PAGENT_WXSEND', os.path.join(HOME, 'tools', 'wxsend', 'wxsend'))
+LOCK = os.path.join(BASE, 'daemon.lock')
+
+KINDS = {'code': '代码', 'content': '内容', 'ops': '运维', 'life': '生活', 'research': '研究'}
+
+
+# ── 基础读写 ────────────────────────────────────────────────
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, 'a') as f:
+        f.write(f'[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n')
+
+
+# ── 项目数据采集 ────────────────────────────────────────────
+def state_file(p):
+    mem = p.get('memory')
+    if not mem:
+        return None
+    path = os.path.join(HOME, '.ai', 'projects', mem.get('project', p['id']),
+                        'memory', 'designs', mem.get('slug', p['id']), 'STATE.md')
+    return path if os.path.exists(path) else None
+
+
+NEXT_RE = re.compile(r'next[_ ]?action\s*[:：]\s*\*{0,2}\s*(.+)', re.I)
+STATUS_RE = re.compile(r'^\s*[-*]?\s*(?:status|状态)\s*[:：]\s*(.+)', re.I | re.M)
+
+
+def parse_state(path):
+    try:
+        text = open(path, encoding='utf-8', errors='replace').read(200000)
+    except OSError:
+        return None, None
+    m = NEXT_RE.search(text)
+    nxt = m.group(1).strip().strip('*').strip()[:120] if m else None
+    s = STATUS_RE.search(text)
+    st = s.group(1).strip()[:60] if s else None
+    return nxt, st
+
+
+def board_stats(root):
+    bdir = os.path.join(root, '.dsh-graph')
+    if not os.path.isdir(bdir):
+        return None
+    goals_dir = os.path.join(bdir, 'goals')
+    counts = {}
+    latest = 0
+    if os.path.isdir(goals_dir):
+        for name in os.listdir(goals_dir):
+            gpath = os.path.join(goals_dir, name, 'goal.md')
+            if not os.path.isfile(gpath):
+                continue
+            latest = max(latest, os.path.getmtime(gpath))
+            try:
+                head = open(gpath, encoding='utf-8', errors='replace').read(1200)
+            except OSError:
+                continue
+            m = re.search(r'^status:\s*(\S+)', head, re.M)
+            st = m.group(1).strip('"\'') if m else 'unknown'
+            counts[st] = counts.get(st, 0) + 1
+    return {'counts': counts, 'total': sum(counts.values()), 'latest': latest}
+
+
+def git_info(root):
+    try:
+        r = subprocess.run(['git', '-C', root, 'log', '-1', '--format=%ct%x1f%h%x1f%s'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        ts, sha, subj = r.stdout.strip().split('\x1f', 2)
+        dirty = subprocess.run(['git', '-C', root, 'status', '--porcelain'],
+                               capture_output=True, text=True, timeout=5).stdout
+        return {'ts': int(ts), 'sha': sha, 'subject': subj[:80],
+                'dirty': len([l for l in dirty.splitlines() if l.strip()])}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+SESSION_ROOT = os.path.join(HOME, '.dsh', 'sessions')
+
+
+def project_key(cwd):
+    out, sep = [], False
+    for ch in cwd:
+        code = ord(ch)
+        if ch in '/\\:':
+            if not sep:
+                out.append('-')
+            sep = True
+        elif ch != '~' and (ch.isalnum() or ch in '._-') and code < 128:
+            out.append(ch)
+            sep = False
+        else:
+            out.append('~%04X' % code)
+            sep = False
+    s = ''.join(out).lstrip('-') or 'root'
+    return '--' + s[:251] + '--'
+
+
+def session_activity(root):
+    """该项目工作区下最近一次会话活动时间（用于播报里的「最近活动」）。"""
+    if not root:
+        return 0
+    d = os.path.join(SESSION_ROOT, project_key(os.path.realpath(root)))
+    if not os.path.isdir(d):
+        return 0
+    latest = 0
+    try:
+        for name in os.listdir(d):
+            f = os.path.join(d, name, 'session.v3.jsonl.zstd')
+            if os.path.exists(f):
+                try:
+                    latest = max(latest, os.path.getmtime(f))
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return latest
+
+
+def in_quiet(cfg, ts=None):
+    q = (cfg.get('schedule') or {}).get('quiet') or {}
+    start, end = q.get('from'), q.get('to')
+    if not start or not end:
+        return False
+    hm = datetime.fromtimestamp(ts or time.time()).strftime('%H:%M')
+    if start <= end:
+        return start <= hm < end
+    return hm >= start or hm < end
+
+
+def git_since(root, since, limit=3):
+    try:
+        r = subprocess.run(['git', '-C', root, 'log', '--since', str(int(since)), '-n', str(limit),
+                            '--format=%ct%x1f%s'], capture_output=True, text=True, timeout=6)
+        if r.returncode != 0:
+            return []
+        out = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split('\x1f', 1)
+            if len(parts) == 2:
+                out.append({'ts': int(parts[0]), 'subject': parts[1][:80]})
+        return out
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def session_stats(root):
+    """返回 {ids:[...], count, latest_at, latest_id}（按会话文件 mtime）。"""
+    d = os.path.join(SESSION_ROOT, project_key(os.path.realpath(root or '')))
+    out = {'ids': [], 'count': 0, 'latest_at': 0, 'latest_id': None}
+    if not os.path.isdir(d):
+        return out
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        f = os.path.join(d, name, 'session.v3.jsonl.zstd')
+        if not os.path.exists(f):
+            continue
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        out['ids'].append(name)
+        if mt > out['latest_at']:
+            out['latest_at'] = mt
+            out['latest_id'] = name
+    out['count'] = len(out['ids'])
+    return out
+
+
+def latest_session_topic(root):
+    """该项目最近会话的首条用户消息与时间（用于「进展」）。"""
+    d = os.path.join(SESSION_ROOT, project_key(os.path.realpath(root or '')))
+    if not os.path.isdir(d):
+        return None
+    best = None
+    try:
+        for name in os.listdir(d):
+            f = os.path.join(d, name, 'session.v3.jsonl.zstd')
+            if not os.path.exists(f):
+                continue
+            mt = os.path.getmtime(f)
+            if best is None or mt > best[0]:
+                best = (mt, f)
+    except OSError:
+        return None
+    if not best:
+        return None
+    mt, f = best
+    topic = ''
+    try:
+        proc = subprocess.Popen(['zstd', '-dc', f], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        raw = b''
+        while raw.count(b'\n') < 25 and len(raw) < 200000:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            raw += chunk
+        proc.kill()
+        proc.wait(timeout=5)
+        for line in raw.splitlines()[:25]:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if j.get('type') == 'user/message':
+                content = (j.get('data') or {}).get('content') or []
+                topic = ' '.join(' '.join(c.get('text', '') for c in content if isinstance(c, dict)).split())[:60]
+                if topic:
+                    break
+    except Exception:
+        pass
+    return {'at': mt, 'topic': topic}
+
+
+def collect(p):
+    root = p.get('root', '')
+    info = {
+        'id': p['id'], 'name': p.get('name', p['id']), 'kind': p.get('kind', 'code'),
+        'status': p.get('status', 'active'), 'priority': p.get('priority', 50),
+        'exists': os.path.isdir(root), 'next': None, 'state_status': None,
+        'board': None, 'git': None, 'activity': 0, 'memory': bool(p.get('memory')),
+    }
+    sf = state_file(p) if info['exists'] else None
+    if sf:
+        nxt, st = parse_state(sf)
+        info['next'], info['state_status'] = nxt, st
+        info['activity'] = max(info['activity'], os.path.getmtime(sf))
+        info['memory'] = True
+    if info['exists']:
+        info['board'] = board_stats(root)
+        if info['board']:
+            info['activity'] = max(info['activity'], info['board']['latest'])
+        info['git'] = git_info(root)
+        if info['git']:
+            info['activity'] = max(info['activity'], info['git']['ts'])
+        try:
+            info['activity'] = max(info['activity'], int(os.path.getmtime(root)))
+        except OSError:
+            pass
+        info['activity'] = max(info['activity'], session_activity(root))
+    return info
+
+
+def rel_time(ts):
+    if not ts:
+        return '无记录'
+    delta = time.time() - ts
+    if delta < 90:
+        return '刚刚'
+    if delta < 3600:
+        return f'{int(delta // 60)} 分钟前'
+    if delta < 86400:
+        return f'{int(delta // 3600)} 小时前'
+    return f'{int(delta // 86400)} 天前'
+
+
+# ── 播报生成 ────────────────────────────────────────────────
+def build_report(cfg):
+    rep = cfg.get('report', {})
+    md = rep.get('format', 'markdown') == 'markdown'
+    reg = load_json(REGISTRY, {'projects': []})
+    projects = [p for p in reg.get('projects', []) if p.get('status') != 'archived']
+    max_chars = int(rep.get('maxChars', 1200))
+
+    state_now = load_json(STATE, {})
+    prev_run = state_now.get('last_run') or (time.time() - 4 * 3600)
+    prev_sessions = state_now.get('sessions') or {}
+
+    entries = []
+    for p in projects:
+        info = collect(p)
+        prog, changed = [], False
+        commits = git_since(p.get('root', ''), prev_run) if info['exists'] else []
+        if commits:
+            prog.append(f"git {len(commits)} 次提交（{commits[0]['subject'][:40]}）")
+            changed = True
+        if info['git'] and info['git']['dirty']:
+            prog.append(f"{info['git']['dirty']} 个文件待提交")
+            changed = True
+        stats = session_stats(p.get('root', '')) if info['exists'] else {'ids': [], 'count': 0, 'latest_at': 0, 'latest_id': None}
+        prev = prev_sessions.get(p['id']) or {}
+        prev_ids = set(prev.get('ids') or [])
+        new_ids = [i for i in stats['ids'] if i not in prev_ids] if prev_ids else []
+        if new_ids:
+            prog.append(f"新增 {len(new_ids)} 个会话（共 {stats['count']}）")
+            changed = True
+        elif stats['latest_at'] and stats['latest_at'] > float(prev.get('latest_at') or 0):
+            prog.append(f"会话更新（{rel_time(stats['latest_at'])}）")
+            changed = True
+        elif stats['count'] and not prev_ids:
+            prog.append(f"会话 {stats['count']} 个（最近 {rel_time(stats['latest_at'])}）")
+        topic = latest_session_topic(p.get('root', '')) if (info['exists'] and (new_ids or stats['latest_at'] > prev_run)) else None
+        if topic and topic['topic']:
+            prog.append(f"「{topic['topic'][:36]}」")
+        if info['board'] and info['board']['total']:
+            prog.append(f"看板 {info['board']['total']} 个目标")
+            changed = True
+        nxt = info['next'] or info.get('state_status') or p.get('note') or '（未登记进展）'
+        if str(nxt).startswith('自动发现：'):
+            nxt = '待确认项目目标与下一步（自动发现）'
+        stale = bool(info['activity']) and time.time() - info['activity'] > 14 * 86400
+        entries.append({'p': p, 'info': info, 'prog': prog, 'changed': changed, 'next': nxt,
+                        'stale': stale, 'priority': p.get('priority', 50)})
+
+    entries.sort(key=lambda e: (not e['changed'], -e['priority'], e['p']['id']))
+    blocks, unchanged = [], []
+    for e in entries:
+        info, p = e['info'], e['p']
+        if not e['changed']:
+            unchanged.append(info['name'])
+            continue
+        rel = rel_time(info['activity'])
+        missing = '' if info['exists'] else ' · ⚠ 目录不存在'
+        stale_hint = ' · ⚠ 14 天未动' if e['stale'] else ''
+        name, kind = info['name'], KINDS.get(info['kind'], info['kind'])
+        blk = [f'- **{name}**（{kind}）· {rel}{missing}{stale_hint}' if md else f'{name}（{kind}）· {rel}{missing}{stale_hint}']
+        blk.append('  进展：' + (' · '.join(e['prog']) if e['prog'] else '本期无新变化'))
+        blk.append(f"  下一步：{e['next']}")
+        bits = []
+        if info['git']:
+            g = info['git']
+            bits.append(f"git {g['sha']}" + (f" +{g['dirty']} 改动" if g['dirty'] else ''))
+        if not info['memory']:
+            bits.append('未落盘')
+        if bits:
+            if md:
+                bits = [f'`{b}`' for b in bits]
+            blk.append('  ' + (' · '.join(bits) if md else ' / '.join(bits)))
+        blocks.append('\n'.join(blk))
+
+    blocked = [p for p in projects if p.get('status') == 'blocked']
+    active = [p for p in projects if p.get('status') == 'active']
+    infos = [e['info'] for e in entries]
+    recent = [i for i in infos if i['activity'] and time.time() - i['activity'] < 6 * 3600]
+    now = datetime.now()
+
+    if md:
+        lines = [f'**项目播报** · {now:%m-%d %H:%M}', '',
+                 f'{len(projects)} 个项目｜活跃 {len(active)} · 阻塞 {len(blocked)} · 近 6 小时更新 {len(recent)}', '']
+    else:
+        lines = [f'【项目播报 {now:%m-%d %H:%M}】',
+                 f'项目 {len(projects)} 个（活跃 {len(active)}，阻塞 {len(blocked)}），近 6 小时有更新 {len(recent)} 个', '']
+
+    scan_st = load_json(SCAN_STATE, {})
+    if scan_st.get('lastRun') and time.time() - scan_st['lastRun'] < 7 * 86400:
+        added = scan_st.get('added') or []
+        cands = scan_st.get('candidates') or []
+        if added:
+            lines.append('自动发现：新增 ' + str(len(added)) + ' 个项目（' + '、'.join(a['name'] for a in added[:3]) + '）')
+        elif cands:
+            lines.append(f'自动发现：{len(cands)} 个候选待确认（pagent scan）')
+        if added or cands:
+            lines.append('')
+
+    # 节点离线提醒（超过 3 天没上报）
+    try:
+        off = []
+        for n in load_nodes().get('nodes', []):
+            if n.get('local'):
+                continue
+            ls = float(n.get('lastSeen') or 0)
+            if not ls:
+                off.append(f"{n.get('name') or n['id']}（从未上报）")
+            elif time.time() - ls > 3 * 86400:
+                off.append(f"{n.get('name') or n['id']}（{int((time.time()-ls)//86400)} 天）")
+        if off:
+            lines.append('节点离线：' + '、'.join(off))
+            lines.append('')
+    except Exception:
+        pass
+
+    budget = max_chars - len('\n'.join(lines)) - 200
+    keep, total = [], 0
+    for b in blocks:
+        if total + len(b) + 1 > budget:
+            break
+        keep.append(b)
+        total += len(b) + 1
+    omitted = len(blocks) - len(keep)
+    parts = keep[:]
+    if unchanged:
+        parts.append('无变化：' + '、'.join(unchanged[:8]) + ('…' if len(unchanged) > 8 else ''))
+    if omitted:
+        parts.append(f'……另有 {omitted} 个有变化的项目未展开')
+    sep = '\n' if md else '\n\n'
+    lines.append(sep.join(parts))
+    if blocked:
+        names = '、'.join(p.get('name', p['id']) for p in blocked)
+        lines.append('')
+        lines.append(f'**阻塞**：{names}' if md else f'阻塞：{names}')
+    return '\n'.join(lines)
+
+
+# ── 自动发现 ────────────────────────────────────────────────
+WS_STORE = os.path.join(HOME, '.dsh', 'storages', 'workspace.json')
+SCAN_STATE = os.path.join(BASE, 'scan-state.json')
+SCAN_IGNORE = os.path.join(BASE, 'scan-ignore.json')
+NODES = os.path.join(BASE, 'nodes.json')
+NODE_SNAPS = os.path.join(BASE, 'nodes')
+
+# 不参与扫描的目录（宿主/缓存/系统/已有项目内部）
+EXCLUDE_NAMES = {'.git', 'node_modules', '.venv', 'venv', '__pycache__', 'Library',
+                 'Applications', 'Movies', 'Music', 'Pictures', 'Public', 'Downloads',
+                 '.npm', '.cache', '.Trash', '.DS_Store', 'dist', 'build', 'target',
+                 'go', 'vendor', 'attachments', 'logs'}
+MARKERS = ['.git', 'package.json', 'pnpm-workspace.yaml', 'pyproject.toml', 'setup.py',
+           'go.mod', 'Cargo.toml', 'AGENTS.md', 'CLAUDE.md', '.dsh-graph', 'README.md']
+
+
+def dsh_workspaces():
+    """DSH 工作区 = 用户真实用过的「工作分区」，带会话数与最近活跃时间。"""
+    data = load_json(WS_STORE, {})
+    out = {}
+    for wid, w in (data.get('tables', {}).get('workspaces') or {}).items():
+        path = os.path.realpath(w.get('path', '') or '')
+        if not path:
+            continue
+        sids = w.get('sessionIds') or []
+        latest = 0
+        for sid in sids:
+            for f in glob.glob(os.path.join(HOME, '.dsh', 'sessions', '*', sid + '*')):
+                try:
+                    latest = max(latest, os.path.getmtime(f))
+                except OSError:
+                    pass
+        out[path] = {'path': path, 'title': w.get('title') or os.path.basename(path),
+                     'sessions': len(sids), 'last': latest}
+    return out
+
+
+def is_excluded(path):
+    parts = set(path.split(os.sep))
+    if parts & EXCLUDE_NAMES:
+        return True
+    if path.startswith(os.path.join(HOME, '.dsh')) or path.startswith(os.path.join(HOME, '.ai')):
+        return True
+    if path.startswith(os.path.join(HOME, 'Library')):
+        return True
+    return False
+
+
+def _marker_info(path):
+    found = []
+    latest = 0
+    for m in MARKERS:
+        fp = os.path.join(path, m)
+        if os.path.exists(fp):
+            found.append(m)
+            if m == '.git':
+                continue  # .git 的 mtime 会被 git 自身刷新，不代表项目活跃
+            try:
+                latest = max(latest, os.path.getmtime(fp))
+            except OSError:
+                pass
+    return found, latest
+
+
+def scan_filesystem(cfg):
+    scan = cfg.get('scan', {})
+    roots = scan.get('roots', [os.path.join(HOME, 'Desktop'), HOME])
+    depth = int(scan.get('depth', 1))
+    found = {}
+    for r in roots:
+        base = os.path.realpath(os.path.expanduser(r))
+        if not os.path.isdir(base):
+            continue
+        # 扫描根本身不是项目（例如家目录 / 桌面）
+        found.pop(base, None)
+        level = [(base, 0)]
+        while level:
+            cur, d = level.pop()
+            if d >= depth:
+                continue
+            try:
+                entries = sorted(os.scandir(cur), key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                if not e.is_dir(follow_symlinks=False) or e.name.startswith('.'):
+                    continue
+                if e.name in EXCLUDE_NAMES:
+                    continue
+                sub = os.path.realpath(e.path)
+                if is_excluded(sub):
+                    continue
+                markers, latest = _marker_info(sub)
+                if markers:
+                    found[sub] = {'markers': markers, 'last': latest}
+                # 只对根目录的一级做 marker 判断；更深层仅当自身像项目才继续
+                level.append((sub, d + 1))
+    return found
+
+
+def load_nodes():
+    return load_json(NODES, {'version': 1, 'nodes': []})
+
+
+def find_node(node_id):
+    return next((n for n in load_nodes().get('nodes', []) if n.get('id') == node_id), None)
+
+
+def remote_snapshots():
+    out = []
+    if not os.path.isdir(NODE_SNAPS):
+        return out
+    for f in sorted(glob.glob(os.path.join(NODE_SNAPS, '*.json'))):
+        snap = load_json(f, None)
+        if isinstance(snap, dict) and snap.get('node'):
+            out.append(snap)
+    return out
+
+
+def save_node_scan(payload):
+    node_id = str(payload.get('node') or '').strip()
+    node = find_node(node_id)
+    if not node:
+        raise ValueError(f'未登记的节点 {node_id}')
+    token = str(payload.get('token') or '')
+    import hmac
+    if not token or not hmac.compare_digest(token, str(node.get('token') or '')):
+        raise ValueError('节点 token 不正确')
+    projects = payload.get('projects') or []
+    if not isinstance(projects, list) or len(projects) > 2000:
+        raise ValueError('projects 字段非法')
+    snap = {'node': node_id, 'name': node.get('name') or node_id,
+            'platform': node.get('platform', ''), 'scanned_at': time.time(),
+            'projects': projects}
+    os.makedirs(NODE_SNAPS, exist_ok=True)
+    save_json(os.path.join(NODE_SNAPS, node_id + '.json'), snap)
+    node['lastSeen'] = time.time()
+    nodes = load_nodes()
+    for n in nodes['nodes']:
+        if n['id'] == node_id:
+            n['lastSeen'] = node['lastSeen']
+    save_json(NODES, nodes)
+    log(f'[node] {node_id} 上报 {len(projects)} 个项目')
+    return snap
+
+
+def cmd_nodes(argv):
+    nodes = load_nodes()
+    if not argv:
+        if not nodes['nodes']:
+            print('还没有登记节点。pagent nodes add --id hos --name "HOS 手机" --platform android')
+            return 0
+        print(f"{'id':16} {'名称':14} {'平台':10} {'最近上报':12} {'项目':>4}  状态")
+        for n in nodes['nodes']:
+            snap = load_json(os.path.join(NODE_SNAPS, n['id'] + '.json'), None)
+            last = snap.get('scanned_at') if snap else None
+            print(f"{n['id']:16} {(n.get('name') or '')[:12]:14} {n.get('platform',''):10} "
+                  f"{rel_time(last) if last else '从未':12} {len(snap.get('projects', [])) if snap else 0:>4}  "
+                  f"{'在线' if last and time.time() - last < 86400 else '离线'}")
+        return 0
+    action = argv[0]
+    if action == 'add':
+        opts = {}
+        i = 1
+        while i < len(argv):
+            if argv[i].startswith('--') and i + 1 < len(argv):
+                opts[argv[i][2:]] = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        nid = opts.get('id')
+        if not nid:
+            print('缺少 --id')
+            return 1
+        if find_node(nid):
+            print(f'节点 {nid} 已存在')
+            return 1
+        nodes['nodes'].append({
+            'id': nid, 'name': opts.get('name', nid), 'platform': opts.get('platform', ''),
+            'address': opts.get('address', ''), 'roots': opts.get('roots', ''),
+            'token': secrets.token_urlsafe(24), 'createdAt': time.time(),
+        })
+        save_json(NODES, nodes)
+        n = find_node(nid)
+        print(f'已登记节点 {nid}，token: {n["token"]}')
+        print('把 token 和服务器地址写进节点上的 ~/.pagent-node.json：')
+        print('  {"server":"http://192.168.1.3:9199","token":"%s","id":"%s"}' % (n['token'], nid))
+        return 0
+    if action == 'rm':
+        if not argv[1:]:
+            return 1
+        nodes['nodes'] = [n for n in nodes['nodes'] if n['id'] != argv[1]]
+        save_json(NODES, nodes)
+        print('已移除节点', argv[1])
+        return 0
+    print('用法: pagent nodes [add --id X --name Y --platform android | rm X]')
+    return 1
+
+
+def slugify(text):
+    s = re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
+    return s or 'project'
+
+
+def load_ignore():
+    return load_json(SCAN_IGNORE, {'ignore': {}, 'blocked': []})
+
+
+def is_ignored(path):
+    ig = load_ignore()
+    now = time.time()
+    for prefix in ig.get('blocked', []):
+        if path == prefix or path.startswith(prefix.rstrip('/') + '/'):
+            return True
+    until = (ig.get('ignore') or {}).get(path)
+    return bool(until and until > now)
+
+
+def discover(cfg=None):
+    cfg = cfg or load_json(CONFIG, {})
+    scan = cfg.get('scan', {})
+    threshold = int(scan.get('threshold', 70))
+    reg = load_json(REGISTRY, {'projects': []})
+    known = {os.path.realpath(p.get('root', '')): p for p in reg['projects']}
+    ws = dsh_workspaces()
+    fs = scan_filesystem(cfg)
+    now = time.time()
+    paths = set(ws) | set(fs)
+    out = []
+    home = os.path.realpath(HOME)
+    for path in sorted(paths):
+        if path in (home, os.path.realpath(os.path.expanduser('~/Desktop'))):
+            continue
+        if path in known or is_excluded(path) or is_ignored(path):
+            continue
+        # 嵌套在已登记项目内部的目录不算新项目
+        if any(path != root and path.startswith(root + os.sep) for root in known):
+            continue
+        if not os.path.isdir(path):
+            continue
+        info = ws.get(path, {})
+        markers = fs.get(path, {}).get('markers', [])
+        git = git_info(path)
+        score, reasons = 0, []
+        if info:
+            score += 50
+            reasons.append(f'DSH 工作区（{info["sessions"]} 个会话）')
+            if info['last'] and now - info['last'] < 30 * 86400:
+                score += 15
+                reasons.append('近 30 天用过')
+            elif info['last'] and now - info['last'] < 90 * 86400:
+                score += 5
+        if git:
+            score += 30
+            reasons.append(f'git 仓库（{git["subject"][:24]}）')
+            if git['ts'] and now - git['ts'] < 30 * 86400:
+                score += 10
+                reasons.append('近 30 天有提交')
+        if markers:
+            score += 5 * min(len(markers), 2)
+            reasons.append('含 ' + ' / '.join(markers[:3]))
+        activity = max([info.get('last', 0), fs.get(path, {}).get('last', 0),
+                        git['ts'] if git else 0,
+                        os.path.getmtime(path) if os.path.exists(path) else 0])
+        name = info.get('title') or os.path.basename(path)
+        out.append({
+            'path': path, 'name': name, 'id': slugify(name), 'kind': 'code',
+            'score': min(score, 100), 'reasons': reasons, 'git': git,
+            'sessions': info.get('sessions', 0), 'last': activity,
+            'workspace': bool(info), 'auto': score >= threshold,
+        })
+    # 远程节点上报的项目
+    seen_paths = {c['path'] for c in out}
+    for snap in remote_snapshots():
+        node_id = snap.get('node')
+        for rp in snap.get('projects') or []:
+            path = str(rp.get('path') or '').strip()
+            if not path or path in known or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            markers = rp.get('markers') or []
+            git = rp.get('git')
+            score = 25
+            reasons = [f'来自节点 {snap.get("name") or node_id}']
+            if git:
+                score += 30
+                reasons.append('git 仓库')
+            if markers:
+                score += 5 * min(len(markers), 2)
+                reasons.append('含 ' + ' / '.join(markers[:2]))
+            last = float(rp.get('last') or snap.get('scanned_at') or 0)
+            last = min(last, now)
+            if last and now - last < 30 * 86400:
+                score += 10
+                reasons.append('近 30 天有改动')
+            out.append({
+                'path': path, 'name': rp.get('name') or os.path.basename(path),
+                'id': slugify(rp.get('name') or os.path.basename(path)), 'kind': rp.get('kind', 'code'),
+                'score': min(score, 100), 'reasons': reasons, 'git': git, 'sessions': 0,
+                'last': last, 'workspace': False, 'node': node_id,
+                'auto': score >= threshold and node_id in {n['id'] for n in load_nodes().get('nodes', [])},
+            })
+    out.sort(key=lambda x: (-x['score'], -x['last']))
+    return out
+
+
+def auto_scan(cfg=None):
+    """扫描 + 自动登记高置信度候选，返回本次结果摘要。"""
+    cfg = cfg or load_json(CONFIG, {})
+    cands = discover(cfg)
+    auto = [c for c in cands if c['auto']]
+    added = []
+    if cfg.get('scan', {}).get('autoAdd', True) and auto:
+        reg = load_json(REGISTRY, {'projects': []})
+        used = {p['id'] for p in reg['projects']}
+        for c in auto:
+            pid = c['id']
+            n = 2
+            while pid in used:
+                pid = f"{c['id']}-{n}"
+                n += 1
+            used.add(pid)
+            reg['projects'].append({
+                'id': pid, 'name': c['name'], 'aliases': [pid, c['name']],
+                'kind': c['kind'], 'status': 'active', 'priority': 40,
+                'root': c['path'], 'memory': None,
+                'note': '自动发现：' + '；'.join(c['reasons'][:3]),
+                'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+            })
+            added.append({'id': pid, 'name': c['name'], 'path': c['path'], 'score': c['score']})
+        if added:
+            save_json(REGISTRY, reg)
+    st = load_json(SCAN_STATE, {})
+    cands_sorted = sorted([c for c in cands if not c['auto']], key=lambda c: -c['score'])[:30]
+    st.update({'lastRun': time.time(), 'added': added, 'candidates': cands_sorted})
+    save_json(SCAN_STATE, st)
+    log(f"[scan] 候选 {len(cands)}，自动登记 {len(added)}")
+    return {'added': added, 'candidates': st['candidates'], 'at': st['lastRun']}
+
+
+def cmd_scan(argv):
+    cfg = load_json(CONFIG, {})
+    if '--add' in argv:
+        res = auto_scan(cfg)
+        print(f"自动登记 {len(res['added'])} 个，剩余候选 {len(res['candidates'])} 个")
+        for a in res['added']:
+            print(f"  + {a['id']:20} {a['name'][:16]:18} {a['path']}")
+        return 0
+    cands = discover(cfg)
+    if not cands:
+        print('没有发现新项目候选')
+        return 0
+    print(f"{'✓':2} {'score':5} {'id':20} {'名称':16} {'最近活动':10} 路径")
+    for c in cands:
+        mark = '·' if c['auto'] else '?'
+        print(f"{mark:2} {c['score']:<5} {c['id']:20} {c['name'][:14]:16} "
+              f"{rel_time(c['last']):10} {c['path']}")
+        print(f"     理由：{'；'.join(c['reasons']) or '—'}")
+    print(f"\n共 {len(cands)} 个；· = 达到自动登记阈值，? = 仅候选。"
+          f"执行 pagent scan --add 自动登记高置信度项目。")
+    return 0
+
+
+# ── 发送 ────────────────────────────────────────────────────
+def channel_state():
+    return load_json(CHANNEL_STATE, {'stale': False, 'fails': 0})
+
+
+def _ctx_hash():
+    st = load_json(WXPUSH_STATE, {})
+    token = st.get('context_token') or ''
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def channel_stale():
+    st = channel_state()
+    if not st.get('stale'):
+        return False
+    # 用户给 bot 发过消息 → context_token 变了 → 自动解除 stale
+    if st.get('ctx') and st['ctx'] != _ctx_hash():
+        save_json(CHANNEL_STATE, {'stale': False, 'fails': 0, 'lastOk': time.time()})
+        log('[channel] 检测到 context_token 已刷新，恢复播报')
+        return False
+    return True
+
+
+def mark_channel(ok, err=''):
+    st = channel_state()
+    if ok:
+        st = {'stale': False, 'fails': 0, 'lastOk': time.time()}
+    else:
+        st['fails'] = int(st.get('fails', 0)) + 1
+        st['ctx'] = _ctx_hash()
+        st['lastError'] = (err or '')[:200]
+        st['at'] = time.time()
+        if st['fails'] >= 2:
+            st['stale'] = True
+    save_json(CHANNEL_STATE, st)
+
+
+def send_wechat(text):
+    if not os.path.exists(WXSEND):
+        return 3, 'wxsend 不存在'
+    r = subprocess.run([WXSEND], input=text, capture_output=True, text=True, timeout=30)
+    msg = (r.stdout or r.stderr).strip()
+    if r.returncode == 0:
+        mark_channel(True)
+    elif r.returncode == 2:
+        mark_channel(False, msg.splitlines()[0] if msg else 'queued')
+    return r.returncode, msg
+
+
+def refresh_local_node(cfg=None):
+    """把本机也当作一个节点：播报前刷新一次快照，面板里就不会显示「离线」。"""
+    cfg = cfg or load_json(CONFIG, {})
+    nodes = load_nodes()
+    node = next((n for n in nodes.get('nodes', []) if n.get('local')), None)
+    if not node:
+        return
+    fs = scan_filesystem(cfg)
+    projects = []
+    for path, meta in fs.items():
+        projects.append({'path': path, 'name': os.path.basename(path), 'markers': meta.get('markers', []),
+                         'git': git_info(path), 'last': meta.get('last', 0)})
+    try:
+        save_node_scan({'node': node['id'], 'token': node.get('token', ''),
+                        'platform': 'darwin', 'projects': projects})
+        log(f'[node] 本机快照已刷新（{len(projects)} 个项目）')
+    except ValueError as e:
+        log(f'[node] 本机快照刷新失败: {e}')
+
+
+def save_session_snapshot():
+    st = load_json(STATE, {})
+    reg = load_json(REGISTRY, {'projects': []})
+    snap = {}
+    for p in reg.get('projects', []):
+        snap[p['id']] = session_stats(p.get('root', ''))
+    st['sessions'] = snap
+    save_json(STATE, st)
+
+
+def do_report(cfg, quiet=False):
+    text = build_report(cfg)
+    if channel_stale():
+        log('[report] 跳过：微信通道 context_token 过期（等你给 bot 发消息刷新）')
+        if not quiet:
+            print('⚠️ 微信通道过期，本次播报已跳过（不排队）；在微信里给 bot 发任意一句话即可恢复')
+        return 2, text, 'SKIP_CHANNEL_STALE'
+    with open(LAST, 'w') as f:
+        f.write(text + '\n')
+    code, msg = send_wechat(text)
+    try:
+        save_session_snapshot()
+    except Exception as e:
+        log(f'[report] 会话快照失败: {e!r}')
+    try:
+        refresh_local_node(cfg)
+    except Exception as e:
+        log(f'[node] 本机快照刷新异常: {e!r}')
+    log(f'report exit={code} {msg.splitlines()[-1] if msg else ""}')
+    # 播报历史（面板读取）
+    try:
+        with open(HISTORY, 'a') as h:
+            h.write(json.dumps({'at': time.time(), 'exit': code, 'text': text},
+                               ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+    if not quiet:
+        print(text)
+        print(f'\n[wechat exit {code}] {msg}')
+    return code, text, msg
+
+
+
+def do_report_with_image(cfg, quiet=False, force=None):
+    """播报（文字）+ 可选附图；force=True/False 覆盖 config，None 跟随 config。"""
+    code, text, msg = do_report(cfg, quiet)
+    want = cfg.get('report', {}).get('image') if force is None else force
+    if code == 0 and want:
+        try:
+            png = render_image(cfg)
+            icode, imsg = send_wechat_image(png)
+            if icode != 0:
+                queue_image(png, None)
+            log(f'[image] 附图 exit={icode} {imsg}')
+            if not quiet:
+                print(f'[image exit {icode}] {imsg}')
+        except Exception as e:
+            log(f'[image] 附图失败: {e!r}')
+            if not quiet:
+                print('附图失败:', e)
+    return code, text, msg
+
+
+# ── 微信图片播报 ────────────────────────────────────────────
+WXPUSH_STATE = os.environ.get('WXPUSH_STATE', os.path.join(HOME, '.wxpush', 'state.json'))
+CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c'
+CHROME = os.environ.get('PAGENT_CHROME', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+GRAPHICS = os.path.join(BASE, 'graphics')
+
+
+def _wx_state():
+    st = load_json(WXPUSH_STATE, {})
+    return st.get('bot_token'), st.get('context_token'), st.get('ilink_user_id'), \
+        (st.get('api_base') or 'https://ilinkai.weixin.qq.com/ilink')
+
+
+def _wx_headers(token):
+    uin = base64.b64encode(str(secrets.randbelow(0xffffffff)).encode()).decode()
+    return {'content-type': 'application/json', 'iLink-App-ClientVersion': '1',
+            'X-WECHAT-UIN': uin, 'Authorization': f'Bearer {token}',
+            'AuthorizationType': 'ilink_bot_token'}
+
+
+def _wx_post(url, body, token, timeout=30):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=_wx_headers(token))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _aes_ecb(data, key):
+    size = ((len(data) + 1 + 15) // 16) * 16
+    plen = 16 - (len(data) % 16)
+    padded = data + bytes([plen]) * plen
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+        return enc.update(padded) + enc.finalize(), size
+    except ImportError:
+        # 系统 Python 3.9 没有 cryptography：退回 macOS 自带 openssl
+        r = subprocess.run(['/usr/bin/openssl', 'enc', '-aes-128-ecb', '-K', key.hex(),
+                            '-nosalt', '-nopad'], input=padded, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError('AES 加密失败: ' + (r.stderr.decode()[:120]))
+        return r.stdout, size
+
+
+PENDING_IMG = os.path.join(BASE, 'pending-image.json')
+
+
+def queue_image(png_path, caption=None):
+    save_json(PENDING_IMG, {'path': png_path, 'caption': caption, 'at': time.time()})
+    log(f'[image] 已入队待补发 {os.path.basename(png_path)}')
+
+
+def flush_pending_image():
+    p = load_json(PENDING_IMG, None)
+    if not p:
+        return False
+    if channel_stale():
+        return False
+    # 失败后 2 分钟内不重复尝试，避免空转
+    if time.time() - float(p.get('lastTry', 0)) < 120:
+        return False
+    p['lastTry'] = time.time()
+    save_json(PENDING_IMG, p)
+    path = p.get('path', '')
+    if not os.path.exists(path):
+        os.remove(PENDING_IMG)
+        return False
+    code, msg = send_wechat_image(path, p.get('caption'))
+    if code == 0:
+        try:
+            os.remove(PENDING_IMG)
+        except OSError:
+            pass
+        log('[image] 队列图片补发成功')
+        return True
+    if time.time() - float(p.get('at', 0)) > 3 * 86400:
+        try:
+            os.remove(PENDING_IMG)
+        except OSError:
+            pass
+        log('[image] 队列图片超过 3 天，放弃')
+    return False
+
+
+def send_wechat_image(png_path, caption=None):
+    token, ctx, uid, api = _wx_state()
+    if not token or not ctx or not uid:
+        return 2, 'wxpush 未授权（token/context_token 缺失）'
+    try:
+        raw = open(png_path, 'rb').read()
+    except OSError as e:
+        return 1, f'读图失败: {e}'
+    rawsize = len(raw)
+    rawmd5 = hashlib.md5(raw).hexdigest()
+    key = secrets.token_bytes(16)
+    ciphertext, filesize = _aes_ecb(raw, key)
+    filekey = secrets.token_hex(16)
+    up = _wx_post(api + '/bot/getuploadurl', {
+        'filekey': filekey, 'media_type': 1, 'to_user_id': uid,
+        'rawsize': rawsize, 'rawfilemd5': rawmd5, 'filesize': filesize,
+        'no_need_thumb': True, 'aeskey': key.hex()}, token)
+    url = up.get('upload_full_url') or up.get('upload_param')
+    if not url:
+        return 1, f'getuploadurl 失败: {str(up)[:120]}'
+    if not str(url).startswith('http'):
+        url = f'{CDN_BASE}/upload?encrypted_query_param={urllib.parse.quote(str(url))}&filekey={filekey}'
+    req = urllib.request.Request(url, data=ciphertext,
+                                 headers={'content-type': 'application/octet-stream'})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        if r.status != 200:
+            return 1, f'CDN 上传 HTTP {r.status}'
+        download_param = r.headers.get('x-encrypted-param')
+    if not download_param:
+        return 1, 'CDN 上传响应缺少 x-encrypted-param'
+    aes_b64 = base64.b64encode(key.hex().encode()).decode()
+    body = {'msg': {'from_user_id': '', 'to_user_id': uid,
+                    'client_id': f'pagent:{int(time.time())}:{secrets.randbelow(999999)}',
+                    'message_type': 2, 'message_state': 2, 'context_token': ctx,
+                    'item_list': [{'type': 2, 'image_item': {
+                        'media': {'encrypt_query_param': download_param, 'aes_key': aes_b64,
+                                  'encrypt_type': 1},
+                        'mid_size': filesize}}]},
+            'base_info': {'channel_version': '1.0.0'}}
+    res = _wx_post(api + '/bot/sendmessage', body, token)
+    if res.get('ret', 0) != 0 and not res.get('message_id'):
+        return 1, f'图片发送失败: {str(res)[:160]}'
+    if caption:
+        code, msg = send_wechat(caption)
+        if code != 0:
+            return code, '图片已发，说明文字未送达：' + msg
+    log(f'[image] 已发送 {os.path.basename(png_path)} ({rawsize}B)')
+    return 0, '图片已送达微信'
+
+
+def dashboard_html(cfg, limit=8):
+    reg = load_json(REGISTRY, {'projects': []})
+    projects = [p for p in reg.get('projects', []) if p.get('status') != 'archived']
+    projects.sort(key=lambda p: (-p.get('priority', 50), p['id']))
+    infos = [(p, collect(p)) for p in projects[:limit]]
+    active = sum(1 for p in projects if p.get('status') == 'active')
+    blocked = sum(1 for p in projects if p.get('status') == 'blocked')
+    recent = sum(1 for _, i in infos if i['activity'] and time.time() - i['activity'] < 6 * 3600)
+    st = load_json(STATE, {})
+    rep = cfg.get('report', {})
+    nxt = (st.get('last_run') or 0) + float(rep.get('intervalHours', 4)) * 3600
+    scan_st = load_json(SCAN_STATE, {})
+    scan_line = ''
+    if scan_st.get('lastRun'):
+        added = scan_st.get('added') or []
+        cands = scan_st.get('candidates') or []
+        if added:
+            scan_line = '自动发现：新增 ' + str(len(added)) + ' 个项目（' + '、'.join(a['name'] for a in added[:3]) + '）'
+        elif cands:
+            scan_line = '自动发现：' + str(len(cands)) + ' 个候选待确认'
+    rows = []
+    for p, info in infos:
+        bits = []
+        if info['git']:
+            bits.append('git ' + info['git']['sha'] + ((' +' + str(info['git']['dirty'])) if info['git']['dirty'] else ''))
+        if info['board'] and info['board']['total']:
+            bits.append('看板 ' + str(info['board']['total']))
+        if not info['memory']:
+            bits.append('未落盘')
+        nxt_action = info['next'] or p.get('note') or '（未登记进展）'
+        status_cn = {'active': '活跃', 'paused': '暂停', 'blocked': '阻塞', 'archived': '归档'}.get(p.get('status', 'active'), p.get('status'))
+        rows.append(
+            '<div class="row"><div class="rowhead"><span class="name">' + p.get('name', p['id']) + '</span>'
+            '<span class="chip">' + KINDS.get(p.get('kind', 'code'), p.get('kind')) + '</span>'
+            '<span class="chip st">' + status_cn + '</span>'
+            '<span class="time">' + rel_time(info['activity']) + '</span></div>'
+            '<div class="next">' + nxt_action + '</div>'
+            '<div class="meta">' + ' · '.join(bits) + '</div></div>')
+    more = ''
+    if len(projects) > limit:
+        more = '<div class="more">……另有 ' + str(len(projects) - limit) + ' 个项目未展示</div>'
+    height = 300 + len(infos) * 128 + 60
+    css = (
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{width:1080px;min-height:100vh;background:radial-gradient(900px 420px at 12% -8%,#12303a 0%,transparent 60%),#0b0f14;"
+        "color:#e6edf3;font-family:-apple-system,'PingFang SC','Helvetica Neue',Arial,sans-serif;padding:46px 54px}"
+        ".hdr{display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid #1f2a37;padding-bottom:18px}"
+        "h1{font-size:40px;letter-spacing:1px}h1 span{color:#35d0ba}"
+        ".sub{margin-top:14px;color:#8b98a5;font-size:20px;display:flex;gap:18px;flex-wrap:wrap}"
+        ".sub b{color:#e6edf3;font-weight:600}"
+        ".cards{margin-top:26px;display:flex;flex-direction:column;gap:16px}"
+        ".row{background:#121821;border:1px solid #1f2a37;border-radius:16px;padding:18px 22px;position:relative;overflow:hidden}"
+        ".row::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:#35d0ba}"
+        ".rowhead{display:flex;align-items:center;gap:10px}"
+        ".name{font-size:23px;font-weight:700}"
+        ".chip{font-size:15px;color:#8b98a5;border:1px solid #24303d;border-radius:7px;padding:1px 9px;background:#0d131a}"
+        ".chip.st{color:#7ce7da;border-color:#1f4d48;background:#0f1e1d}"
+        ".time{margin-left:auto;font-size:16px;color:#6f7d8a}"
+        ".next{margin-top:10px;font-size:18px;color:#cfd9e3;line-height:1.5}"
+        ".meta{margin-top:8px;font-size:15px;color:#6f7d8a;font-family:ui-monospace,Menlo,monospace}"
+        ".more{color:#6f7d8a;font-size:15px;margin-top:6px}"
+        ".foot{margin-top:26px;border-top:1px solid #1f2a37;padding-top:16px;color:#6f7d8a;font-size:15px;display:flex;justify-content:space-between;gap:20px}"
+        ".scan{color:#7ce7da}"
+    )
+    foot_time = ('下一条播报 ' + datetime.fromtimestamp(nxt).strftime('%H:%M')) if nxt else ''
+    return ('<!DOCTYPE html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body>'
+            '<div class="hdr"><h1>项目播报 <span>·</span> 个人 Agent</h1>'
+            '<div class="time">' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</div></div>'
+            '<div class="sub"><span><b>' + str(len(projects)) + '</b> 个项目</span>'
+            '<span>活跃 <b>' + str(active) + '</b></span><span>阻塞 <b>' + str(blocked) + '</b></span>'
+            '<span>近 6 小时更新 <b>' + str(recent) + '</b></span></div>'
+            '<div class="cards">' + ''.join(rows) + more + '</div>'
+            '<div class="foot"><span class="scan">' + (scan_line or '自动发现：无新项目') + '</span>'
+            '<span>' + foot_time + '</span></div>'
+            '<script>addEventListener("load",()=>{document.title="H"+document.body.scrollHeight});</script>'
+            '</body></html>')
+
+
+def render_image(cfg=None, out=None):
+    cfg = cfg or load_json(CONFIG, {})
+    os.makedirs(GRAPHICS, exist_ok=True)
+    html = dashboard_html(cfg)
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    html_path = os.path.join(GRAPHICS, 'board-' + ts + '.html')
+    png_path = out or os.path.join(GRAPHICS, 'board-' + ts + '.png')
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    height = 900
+    try:
+        r = subprocess.run([CHROME, '--headless=new', '--disable-gpu',
+                            '--virtual-time-budget=1500', '--dump-dom', 'file://' + html_path],
+                           capture_output=True, timeout=60, text=True)
+        m = re.search(r'<title>H(\d+)</title>', r.stdout or '')
+        if m:
+            height = int(m.group(1)) + 2
+    except Exception:
+        pass
+    subprocess.run([CHROME, '--headless=new', '--disable-gpu', '--hide-scrollbars',
+                    '--force-device-scale-factor=1', '--window-size=1080,' + str(height),
+                    '--screenshot=' + png_path, 'file://' + html_path],
+                   capture_output=True, timeout=60)
+    if not os.path.exists(png_path):
+        raise RuntimeError('截图失败（chrome headless）')
+    for f in sorted(glob.glob(os.path.join(GRAPHICS, 'board-*.png')))[:-20]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return png_path
+
+
+def cmd_image(argv):
+    cfg = load_json(CONFIG, {})
+    rep = cfg.setdefault('report', {})
+    if '--on' in argv or '--off' in argv:
+        rep['image'] = '--on' in argv
+        save_json(CONFIG, cfg)
+        print('周期播报附图：' + ('开启' if rep['image'] else '关闭'))
+        return 0
+    try:
+        png = render_image(cfg)
+    except Exception as e:
+        print('生成图片失败:', e)
+        return 1
+    print('图片:', png)
+    if '--no-send' in argv:
+        return 0
+    reg = load_json(REGISTRY, {'projects': []})
+    n = len([p for p in reg.get('projects', []) if p.get('status') != 'archived'])
+    caption = f'项目播报 · {n} 个项目 · {datetime.now():%m-%d %H:%M}'
+    code, msg = send_wechat_image(png, caption)
+    if code != 0:
+        queue_image(png, caption)
+    print(f'[wechat exit {code}] {msg}')
+    return code
+
+
+# ── 命令 ────────────────────────────────────────────────────
+def cmd_list():
+    reg = load_json(REGISTRY, {'projects': []})
+    if not reg['projects']:
+        print('（空）用 pagent add 添加项目')
+        return 0
+    print(f'{"id":18} {"名称":14} {"类型":6} {"状态":8} {"优先级":6} 根目录')
+    for p in sorted(reg['projects'], key=lambda x: -x.get('priority', 50)):
+        print(f'{p["id"]:18} {p.get("name", "")[:12]:14} {p.get("kind","code"):6} '
+              f'{p.get("status","active"):8} {p.get("priority",50):<6} {p.get("root","")}')
+    return 0
+
+
+def cmd_add(argv):
+    if not argv:
+        print('用法: pagent add <id> --root <path> [--name 名称] [--kind code] [--note 说明]')
+        return 1
+    pid = argv[0]
+    opts = {}
+    i = 1
+    while i < len(argv):
+        k = argv[i]
+        if k.startswith('--') and i + 1 < len(argv):
+            opts[k[2:]] = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    if 'root' not in opts:
+        print('缺少 --root')
+        return 1
+    root = os.path.realpath(os.path.expanduser(opts['root']))
+    if not os.path.isdir(root):
+        print(f'目录不存在: {root}')
+        return 1
+    reg = load_json(REGISTRY, {'projects': []})
+    for p in reg['projects']:
+        if p['id'] == pid:
+            print(f'已存在项目 {pid}')
+            return 1
+        if os.path.realpath(p.get('root', '')) == root:
+            print(f'该目录已绑定项目 {p["id"]}')
+            return 1
+    reg['projects'].append({
+        'id': pid, 'name': opts.get('name', pid), 'aliases': [pid],
+        'kind': opts.get('kind', 'code'), 'status': 'active',
+        'priority': int(opts.get('priority', 50)), 'root': root,
+        'memory': None, 'note': opts.get('note', ''),
+        'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+    })
+    save_json(REGISTRY, reg)
+    print(f'已登记 {pid} → {root}')
+    return 0
+
+
+def cmd_rm(argv):
+    if not argv:
+        return 1
+    reg = load_json(REGISTRY, {'projects': []})
+    before = len(reg['projects'])
+    reg['projects'] = [p for p in reg['projects'] if p['id'] != argv[0]]
+    if len(reg['projects']) == before:
+        print(f'没有项目 {argv[0]}')
+        return 1
+    save_json(REGISTRY, reg)
+    print(f'已移除 {argv[0]}（记忆与目录未动）')
+    return 0
+
+
+def cmd_every(argv):
+    if not argv:
+        print(f'当前间隔 {load_json(CONFIG, {}).get("report", {}).get("intervalHours", 4)} 小时')
+        return 0
+    try:
+        hours = float(argv[0])
+    except ValueError:
+        print('小时数无效')
+        return 1
+    if hours <= 0 or hours > 24 * 30:
+        print('间隔需在 0 到 720 小时之间')
+        return 1
+    cfg = load_json(CONFIG, {})
+    cfg.setdefault('report', {})['intervalHours'] = hours
+    save_json(CONFIG, cfg)
+    print(f'播报间隔已设为 {hours} 小时（守护进程 1 分钟内生效）')
+    return 0
+
+
+def cmd_format(argv):
+    cfg = load_json(CONFIG, {})
+    rep = cfg.setdefault('report', {})
+    cur = rep.get('format', 'markdown')
+    if not argv:
+        print(f'当前播报版式：{cur}（markdown | plain）')
+        return 0
+    v = argv[0].strip().lower()
+    if v not in ('markdown', 'md', 'plain', 'text'):
+        print('只支持 markdown 或 plain')
+        return 1
+    rep['format'] = 'markdown' if v in ('markdown', 'md') else 'plain'
+    save_json(CONFIG, cfg)
+    print(f'播报版式已设为 {rep["format"]}（下一次播报生效）')
+    return 0
+
+
+def cmd_toggle(on):
+    cfg = load_json(CONFIG, {})
+    cfg.setdefault('report', {})['enabled'] = on
+    save_json(CONFIG, cfg)
+    print('周期播报：' + ('已开启' if on else '已关闭'))
+    return 0
+
+
+def daemon_status():
+    pid = None
+    if os.path.exists(LOCK):
+        try:
+            with open(LOCK) as f:
+                pid = int(f.read().strip() or 0)
+            os.kill(pid, 0)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pid = None
+    return pid
+
+
+def cmd_doctor():
+    reg = load_json(REGISTRY, {'projects': []})
+    problems, warnings = [], []
+    seen = {}
+    for p in reg.get('projects', []):
+        pid, root = p['id'], p.get('root', '')
+        if root in seen:
+            problems.append(f'{pid}: 根目录与 {seen[root]} 重复绑定（{root}）')
+        seen[root] = pid
+        if not os.path.isdir(root):
+            problems.append(f'{pid}: 目录不存在 {root}')
+            continue
+        if p.get('memory') and not state_file(p):
+            problems.append(f'{pid}: 记忆缺失（STATE 不存在）')
+        if not os.path.isdir(os.path.join(root, '.dsh-graph')):
+            warnings.append(f'{pid}: 无执行看板（.dsh-graph 缺失）')
+        if not p.get('memory'):
+            warnings.append(f'{pid}: 未落盘（无 ~/.ai STATE）')
+    print(f'项目 {len(reg.get("projects", []))} 个，问题 {len(problems)}，提示 {len(warnings)}')
+    for x in problems:
+        print('  ✗ ' + x)
+    for x in warnings:
+        print('  · ' + x)
+    return 0 if not problems else 1
+
+
+def cmd_status():
+    cfg = load_json(CONFIG, {})
+    st = load_json(STATE, {})
+    r = cfg.get('report', {})
+    pid = daemon_status()
+    print(f"配置:    {CONFIG}")
+    print(f"注册表:  {REGISTRY}（{len(load_json(REGISTRY, {'projects': []})['projects'])} 个项目）")
+    print(f"周期播报: {'开启' if r.get('enabled', True) else '关闭'}，每 {r.get('intervalHours', 4)} 小时，"
+          f"版式 {r.get('format', 'markdown')}，{'附图' if r.get('image') else '不附图'}")
+    print(f"守护进程: {'运行中 pid ' + str(pid) if pid else '未运行'}")
+    sc = load_json(SCAN_STATE, {})
+    if sc.get('lastRun'):
+        print(f"自动发现: 上次扫描 {datetime.fromtimestamp(sc['lastRun']):%m-%d %H:%M}"
+              f"（{rel_time(sc['lastRun'])}），候选 {len(sc.get('candidates', []))} 个")
+    else:
+        print("自动发现: 尚未扫描")
+    q = (cfg.get('schedule') or {}).get('quiet') or {}
+    if q.get('from'):
+        print(f"安静时段: {q['from']} – {q['to']}（期间不播报、不扫描）")
+    last = st.get('last_run')
+    print(f"上次播报: {datetime.fromtimestamp(last):%Y-%m-%d %H:%M}（{rel_time(last)}）" if last else '上次播报: 从未')
+    nxt = (last or time.time()) + r.get('intervalHours', 4) * 3600
+    while in_quiet(cfg, nxt):
+        nxt += 1800
+    print(f"下次播报: {datetime.fromtimestamp(nxt):%Y-%m-%d %H:%M}")
+    wx = subprocess.run([WXSEND, '--status'], capture_output=True, text=True)
+    print('微信通道: ' + ('✅ 可发送' if wx.returncode == 0 else '⚠️ 未接通（播报会排队，授权后补发）'))
+    return 0 if pid else 1
+
+
+def cmd_daemon():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fh = open(LOCK, 'w')
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log('已有守护进程在跑，退出')
+        return 0
+    fh.write(str(os.getpid()))
+    fh.flush()
+    log(f'守护进程启动 pid={os.getpid()}')
+    while True:
+        try:
+            cfg = load_json(CONFIG, {})
+            r = cfg.get('report', {})
+            if in_quiet(cfg):
+                time.sleep(60)
+                continue
+            try:
+                flush_pending_image()
+            except Exception as e:
+                log(f'[image] 补发异常: {e!r}')
+            # 自动发现：按 scan.intervalHours 周期扫描
+            sc = cfg.get('scan', {})
+            if sc.get('enabled', True):
+                sst = load_json(SCAN_STATE, {})
+                sinterval = float(sc.get('intervalHours', 24)) * 3600
+                if time.time() - float(sst.get('lastRun', 0)) >= sinterval:
+                    try:
+                        auto_scan(cfg)
+                    except Exception as e:
+                        log(f'[scan] 异常: {e!r}')
+            if r.get('enabled', True):
+                st = load_json(STATE, {})
+                last = st.get('last_run', 0)
+                interval = float(r.get('intervalHours', 4)) * 3600
+                if time.time() - last >= interval:
+                    do_report_with_image(cfg, quiet=True)
+                    st['last_run'] = time.time()
+                    save_json(STATE, st)
+        except Exception as e:  # 守护进程不能因单次失败退出
+            log(f'循环异常: {e!r}')
+        time.sleep(30)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        return cmd_status()
+    cmd, rest = args[0], args[1:]
+    if cmd in ('list', 'ls'):
+        return cmd_list()
+    if cmd == 'add':
+        return cmd_add(rest)
+    if cmd == 'rm':
+        return cmd_rm(rest)
+    if cmd == 'every':
+        return cmd_every(rest)
+    if cmd == 'format':
+        return cmd_format(rest)
+    if cmd == 'scan':
+        return cmd_scan(rest)
+    if cmd == 'nodes':
+        return cmd_nodes(rest)
+    if cmd == 'image':
+        return cmd_image(rest)
+    if cmd == 'on':
+        return cmd_toggle(True)
+    if cmd == 'off':
+        return cmd_toggle(False)
+    if cmd == 'status':
+        return cmd_status()
+    if cmd == 'doctor':
+        return cmd_doctor()
+    if cmd == 'preview':
+        print(build_report(load_json(CONFIG, {})))
+        return 0
+    if cmd == 'report':
+        cfg0 = load_json(CONFIG, {})
+        force = False if '--no-image' in rest else (True if '--image' in rest else None)
+        code, text, msg = do_report_with_image(cfg0, force=force)
+        st = load_json(STATE, {})
+        st['last_run'] = time.time()
+        save_json(STATE, st)
+        return code
+    if cmd == 'panel':
+        port = os.environ.get('PAGENT_PANEL_PORT', '9199')
+        url = f'http://127.0.0.1:{port}'
+        print(f'管理面板: {url}')
+        try:
+            subprocess.run(['open', url], timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return 0
+    if cmd == 'daemon':
+        return cmd_daemon()
+    print(__doc__)
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
