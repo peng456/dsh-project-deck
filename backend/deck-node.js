@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * pagent-node (Node 版) —— 多节点扫描器，功能与 pagent-node(Python) 一致。
+ * deck-node (Node 版) —— 多节点扫描器，功能与 deck-node(Python) 一致。
  *
- *   node pagent-node.js scan  [--roots ~/Desktop,~] [--depth 1]
- *   node pagent-node.js push  --server http://192.168.1.3:9199 --token XXX --id hos
- *   node pagent-node.js loop  --interval 21600
+ *   node deck-node.js scan  [--roots ~/Desktop,~] [--depth 1]
+ *   node deck-node.js push  --server http://192.168.1.3:9199 --token XXX --id hos
+ *   node deck-node.js loop  --interval 21600
  *
- * 配置也可写 ~/.pagent-node.json：{"server":...,"token":...,"id":...,"roots":[...],"depth":1}
+ * 配置也可写 ~/.deck-node.json：{"server":...,"token":...,"id":...,"roots":[...],"depth":1}
  * 只读：不修改项目文件，只上报目录名 / 标记 / git 最近提交。
  */
 'use strict';
@@ -18,7 +18,7 @@ const https = require('https');
 const { execSync } = require('child_process');
 
 const HOME = os.homedir();
-const CONF = path.join(HOME, '.pagent-node.json');
+const CONF = path.join(HOME, '.deck-node.json');
 const MARKERS = ['.git', 'package.json', 'pnpm-workspace.yaml', 'pyproject.toml', 'setup.py',
   'go.mod', 'Cargo.toml', 'AGENTS.md', 'CLAUDE.md', '.dsh-graph', 'README.md'];
 const SKIP = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'Library',
@@ -111,7 +111,7 @@ async function push(conf, roots, depth) {
     scanned_at: Date.now() / 1000, projects: scan(roots, depth),
   };
   const r = await post(conf.server, payload);
-  console.log(`[pagent-node] 上报 ${payload.projects.length} 个项目 → ${conf.server} (HTTP ${r.status}) ${r.body.slice(0, 120)}`);
+  console.log(`[deck-node] 上报 ${payload.projects.length} 个项目 → ${conf.server} (HTTP ${r.status}) ${r.body.slice(0, 120)}`);
 }
 
 function parseArgs(argv) {
@@ -137,15 +137,15 @@ function parseArgs(argv) {
     return;
   }
   if (!conf.server || !conf.token || !conf.id) {
-    console.error('需要 --server / --token / --id（或写进 ~/.pagent-node.json）');
+    console.error('需要 --server / --token / --id（或写进 ~/.deck-node.json）');
     process.exit(1);
   }
   if (action === 'push') { await push(conf, roots, depth); return; }
   if (action === 'loop') {
     const interval = parseInt(conf.interval || 21600, 10) * 1000;
-    console.log(`[pagent-node] 每 ${interval / 1000}s 上报一次`);
+    console.log(`[deck-node] 每 ${interval / 1000}s 上报一次`);
     for (;;) {
-      try { await push(conf, roots, depth); } catch (e) { console.log('[pagent-node] 上报失败:', e.message); }
+      try { await push(conf, roots, depth); } catch (e) { console.log('[deck-node] 上报失败:', e.message); }
       await new Promise(r => setTimeout(r, interval));
     }
   }

@@ -1,4 +1,4 @@
-# dsh-pagent bundle patch: one insert row activating the personal-agent panel plugin.
+# dsh-project-deck bundle patch: one insert row activating the personal-agent panel plugin.
 - insert:
-    - id: dsh-pagent
-      name: 'dsh-pagent'
+    - id: dsh-project-deck
+      name: 'dsh-project-deck'

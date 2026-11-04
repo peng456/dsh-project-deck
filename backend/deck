@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""pagent —— 个人 Agent 的项目注册表与微信周期播报。
+"""deck —— 项目甲板 的项目注册表与微信周期播报。
 
 用法:
-  pagent list                     列出项目
-  pagent preview                  生成播报文本（不发送）
-  pagent report                   立即生成并推送到微信
-  pagent every <小时>             设置播报间隔（可小数，如 0.5 / 4）
-  pagent on | off                 打开 / 关闭周期播报
-  pagent status                   服务与配置状态
-  pagent add <id> --root <path> [--name 名称] [--kind code] [--note 说明]
-  pagent rm <id>                  移除项目
-  pagent scan [--add]             扫描发现新项目；--add 按阈值自动登记
-  pagent image [--no-send|--on|--off]  生成看板图并推送；--on/--off 开关周期附图
-  pagent daemon                   （由 launchd 调用）周期播报守护进程
+  deck list                     列出项目
+  deck preview                  生成播报文本（不发送）
+  deck report                   立即生成并推送到微信
+  deck every <小时>             设置播报间隔（可小数，如 0.5 / 4）
+  deck on | off                 打开 / 关闭周期播报
+  deck status                   服务与配置状态
+  deck add <id> --root <path> [--name 名称] [--kind code] [--note 说明]
+  deck rm <id>                  移除项目
+  deck scan [--add]             扫描发现新项目；--add 按阈值自动登记
+  deck image [--no-send|--on|--off]  生成看板图并推送；--on/--off 开关周期附图
+  deck daemon                   （由 launchd 调用）周期播报守护进程
 """
 import base64
 import fcntl
@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime
 
 HOME = os.path.expanduser('~')
-BASE = os.path.join(HOME, '.person-agent')
+BASE = os.path.expanduser(os.environ.get('DECK_HOME', '~/.project-deck'))
 CONFIG = os.path.join(BASE, 'config.json')
 REGISTRY = os.path.join(BASE, 'registry.json')
 STATE = os.path.join(BASE, 'report-state.json')
@@ -38,7 +38,7 @@ LAST = os.path.join(BASE, 'last-report.txt')
 HISTORY = os.path.join(BASE, 'reports.jsonl')
 CHANNEL_STATE = os.path.join(BASE, 'channel-state.json')
 LOG = os.path.join(BASE, 'logs', 'daemon.log')
-WXSEND = os.environ.get('PAGENT_WXSEND', os.path.join(HOME, 'tools', 'wxsend', 'wxsend'))
+WXSEND = os.environ.get('DECK_WXSEND', os.path.join(HOME, 'tools', 'wxsend', 'wxsend'))
 LOCK = os.path.join(BASE, 'daemon.lock')
 
 KINDS = {'code': '代码', 'content': '内容', 'ops': '运维', 'life': '生活', 'research': '研究'}
@@ -408,7 +408,7 @@ def build_report(cfg):
         if added:
             lines.append('自动发现：新增 ' + str(len(added)) + ' 个项目（' + '、'.join(a['name'] for a in added[:3]) + '）')
         elif cands:
-            lines.append(f'自动发现：{len(cands)} 个候选待确认（pagent scan）')
+            lines.append(f'自动发现：{len(cands)} 个候选待确认（deck scan）')
         if added or cands:
             lines.append('')
 
@@ -601,7 +601,7 @@ def cmd_nodes(argv):
     nodes = load_nodes()
     if not argv:
         if not nodes['nodes']:
-            print('还没有登记节点。pagent nodes add --id hos --name "HOS 手机" --platform android')
+            print('还没有登记节点。deck nodes add --id hos --name "HOS 手机" --platform android')
             return 0
         print(f"{'id':16} {'名称':14} {'平台':10} {'最近上报':12} {'项目':>4}  状态")
         for n in nodes['nodes']:
@@ -636,7 +636,7 @@ def cmd_nodes(argv):
         save_json(NODES, nodes)
         n = find_node(nid)
         print(f'已登记节点 {nid}，token: {n["token"]}')
-        print('把 token 和服务器地址写进节点上的 ~/.pagent-node.json：')
+        print('把 token 和服务器地址写进节点上的 ~/.deck-node.json：')
         print('  {"server":"http://192.168.1.3:9199","token":"%s","id":"%s"}' % (n['token'], nid))
         return 0
     if action == 'rm':
@@ -646,7 +646,7 @@ def cmd_nodes(argv):
         save_json(NODES, nodes)
         print('已移除节点', argv[1])
         return 0
-    print('用法: pagent nodes [add --id X --name Y --platform android | rm X]')
+    print('用法: deck nodes [add --id X --name Y --platform android | rm X]')
     return 1
 
 
@@ -810,7 +810,7 @@ def cmd_scan(argv):
               f"{rel_time(c['last']):10} {c['path']}")
         print(f"     理由：{'；'.join(c['reasons']) or '—'}")
     print(f"\n共 {len(cands)} 个；· = 达到自动登记阈值，? = 仅候选。"
-          f"执行 pagent scan --add 自动登记高置信度项目。")
+          f"执行 deck scan --add 自动登记高置信度项目。")
     return 0
 
 
@@ -949,7 +949,7 @@ def do_report_with_image(cfg, quiet=False, force=None):
 # ── 微信图片播报 ────────────────────────────────────────────
 WXPUSH_STATE = os.environ.get('WXPUSH_STATE', os.path.join(HOME, '.wxpush', 'state.json'))
 CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c'
-CHROME = os.environ.get('PAGENT_CHROME', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+CHROME = os.environ.get('DECK_CHROME', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
 GRAPHICS = os.path.join(BASE, 'graphics')
 
 
@@ -1061,7 +1061,7 @@ def send_wechat_image(png_path, caption=None):
         return 1, 'CDN 上传响应缺少 x-encrypted-param'
     aes_b64 = base64.b64encode(key.hex().encode()).decode()
     body = {'msg': {'from_user_id': '', 'to_user_id': uid,
-                    'client_id': f'pagent:{int(time.time())}:{secrets.randbelow(999999)}',
+                    'client_id': f'deck:{int(time.time())}:{secrets.randbelow(999999)}',
                     'message_type': 2, 'message_state': 2, 'context_token': ctx,
                     'item_list': [{'type': 2, 'image_item': {
                         'media': {'encrypt_query_param': download_param, 'aes_key': aes_b64,
@@ -1145,7 +1145,7 @@ def dashboard_html(cfg, limit=8):
     )
     foot_time = ('下一条播报 ' + datetime.fromtimestamp(nxt).strftime('%H:%M')) if nxt else ''
     return ('<!DOCTYPE html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body>'
-            '<div class="hdr"><h1>项目播报 <span>·</span> 个人 Agent</h1>'
+            '<div class="hdr"><h1>项目播报 <span>·</span> 项目甲板</h1>'
             '<div class="time">' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</div></div>'
             '<div class="sub"><span><b>' + str(len(projects)) + '</b> 个项目</span>'
             '<span>活跃 <b>' + str(active) + '</b></span><span>阻塞 <b>' + str(blocked) + '</b></span>'
@@ -1220,7 +1220,7 @@ def cmd_image(argv):
 def cmd_list():
     reg = load_json(REGISTRY, {'projects': []})
     if not reg['projects']:
-        print('（空）用 pagent add 添加项目')
+        print('（空）用 deck add 添加项目')
         return 0
     print(f'{"id":18} {"名称":14} {"类型":6} {"状态":8} {"优先级":6} 根目录')
     for p in sorted(reg['projects'], key=lambda x: -x.get('priority', 50)):
@@ -1231,7 +1231,7 @@ def cmd_list():
 
 def cmd_add(argv):
     if not argv:
-        print('用法: pagent add <id> --root <path> [--name 名称] [--kind code] [--note 说明]')
+        print('用法: deck add <id> --root <path> [--name 名称] [--kind code] [--note 说明]')
         return 1
     pid = argv[0]
     opts = {}
@@ -1441,6 +1441,54 @@ def cmd_daemon():
         time.sleep(30)
 
 
+def cmd_demo(argv):
+    """deck demo：生成一个演示环境（假项目 + 独立面板端口），不碰真实注册表。"""
+    import shutil
+    home = os.path.expanduser('~/.project-deck-demo')
+    port = '9299'
+    for i, a in enumerate(argv):
+        if a == '--port' and i + 1 < len(argv):
+            port = argv[i + 1]
+    if os.path.isdir(home):
+        shutil.rmtree(home)
+    os.makedirs(home, exist_ok=True)
+    projects = [
+        ('website', '官网改版', 'content', '落地页文案与设计，本周出第一版'),
+        ('api-server', 'API 服务', 'code', '把 v1 接口迁到 v2，补 12 个测试'),
+        ('notes-app', '笔记应用', 'code', '离线同步还有 2 个 bug'),
+        ('infra', '基础设施', 'ops', '备份脚本换成 restic，验证一次恢复'),
+    ]
+    reg = {'version': 1, 'projects': []}
+    for pid, name, kind, note in projects:
+        root = os.path.join(home, 'projects', pid)
+        os.makedirs(root, exist_ok=True)
+        open(os.path.join(root, 'README.md'), 'w').write(f'# {name}\n\n{note}\n')
+        if kind == 'code':
+            open(os.path.join(root, 'package.json'), 'w').write('{"name":"%s","version":"0.1.0"}\n' % pid)
+        subprocess.run(['git', 'init', '-q'], cwd=root)
+        subprocess.run(['git', '-c', 'user.name=demo', '-c', 'user.email=demo@example.com',
+                        'commit', '-qm', f'init: {name}', '--allow-empty'], cwd=root)
+        reg['projects'].append({'id': pid, 'name': name, 'aliases': [pid], 'kind': kind,
+                                'status': 'active', 'priority': 60, 'root': root,
+                                'memory': None, 'note': note,
+                                'created_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')})
+    cfg = {'version': 1,
+           'report': {'enabled': False, 'intervalHours': 4, 'format': 'markdown', 'image': False},
+           'scan': {'enabled': False, 'intervalHours': 12},
+           'panel': {'allowLanRead': False}}
+    save_json(os.path.join(home, 'registry.json'), reg)
+    save_json(os.path.join(home, 'config.json'), cfg)
+    os.makedirs(os.path.join(home, 'graphics'), exist_ok=True)
+    print(f'演示环境: {home}')
+    print(f'面板地址: http://127.0.0.1:{port}  (Ctrl-C 结束)')
+    env = dict(os.environ, DECK_HOME=home, DECK_PANEL_PORT=str(port), DECK_PANEL_HOST='127.0.0.1')
+    try:
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel.py')], env=env)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -1481,8 +1529,10 @@ def main():
         st['last_run'] = time.time()
         save_json(STATE, st)
         return code
+    if cmd == 'demo':
+        return cmd_demo(rest)
     if cmd == 'panel':
-        port = os.environ.get('PAGENT_PANEL_PORT', '9199')
+        port = os.environ.get('DECK_PANEL_PORT', '9199')
         url = f'http://127.0.0.1:{port}'
         print(f'管理面板: {url}')
         try:

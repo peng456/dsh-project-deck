@@ -1,8 +1,8 @@
-# pagent-node.ps1 —— Windows 版项目扫描器（只读，上报给 pagent 协调端）
+# deck-node.ps1 —— Windows 版项目扫描器（只读，上报给 deck 协调端）
 # 用法：
-#   powershell -ExecutionPolicy Bypass -File pagent-node.ps1 -Server http://192.168.1.3:9199 -Token XXX -Id wencha-win
-#   powershell -ExecutionPolicy Bypass -File pagent-node.ps1 -ScanOnly
-# 配置也可放 $HOME\.pagent-node.json：{"server":..,"token":..,"id":..,"roots":[..],"depth":1}
+#   powershell -ExecutionPolicy Bypass -File deck-node.ps1 -Server http://192.168.1.3:9199 -Token XXX -Id wencha-win
+#   powershell -ExecutionPolicy Bypass -File deck-node.ps1 -ScanOnly
+# 配置也可放 $HOME\.deck-node.json：{"server":..,"token":..,"id":..,"roots":[..],"depth":1}
 
 param(
   [string]$Server = '',
@@ -21,7 +21,7 @@ $Skip = @('node_modules','.venv','venv','__pycache__','AppData','.npm','.cache',
 
 # 读配置
 $conf = @{}
-$confPath = Join-Path $HOME '.pagent-node.json'
+$confPath = Join-Path $HOME '.deck-node.json'
 if (Test-Path $confPath) {
   try { $conf = Get-Content $confPath -Raw | ConvertFrom-Json } catch {}
 }
@@ -92,8 +92,8 @@ function Push-Scan() {
   } | ConvertTo-Json -Depth 8 -Compress
   try {
     $r = Invoke-RestMethod -Uri "$($Server.TrimEnd('/'))/api/node-scan" -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload))
-    Write-Host "[pagent-node] 上报 $($projects.Count) 个项目 -> $Server ($($r.ok))"
-  } catch { Write-Host "[pagent-node] 上报失败: $($_.Exception.Message)" }
+    Write-Host "[deck-node] 上报 $($projects.Count) 个项目 -> $Server ($($r.ok))"
+  } catch { Write-Host "[deck-node] 上报失败: $($_.Exception.Message)" }
 }
 
 if ($ScanOnly) {

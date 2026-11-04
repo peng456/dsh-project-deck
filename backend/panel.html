@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>个人 Agent · 控制台</title>
+<title>项目甲板 · 控制台</title>
 <style>
   :root{
     --bg:#0b0f14; --panel:#121821; --panel2:#0f151d; --line:#1f2a37;
@@ -129,7 +129,7 @@
        padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:12.5px"></div>
   <header>
     <div>
-      <h1>个人 Agent <span>·</span> 控制台</h1>
+      <h1>项目甲板 <span>·</span> 控制台</h1>
       <div class="sub">项目注册表 · 周期播报 · 微信通道　<span id="clock"></span></div>
     </div>
     <div class="pills">
@@ -349,9 +349,9 @@ function renderNodes(){
   const nodes = S.nodes || [];
   $('nodeHint').textContent = nodes.length
     ? `${nodes.filter(n => n.online).length}/${nodes.length} 在线`
-    : '还没有登记节点（pagent nodes add …）';
+    : '还没有登记节点（deck nodes add …）';
   if (!nodes.length){
-    box.innerHTML = '<div class="empty">还没有登记节点。用 <code>pagent nodes add --id hos --name "HOS 手机" --platform android</code> 添加。</div>';
+    box.innerHTML = '<div class="empty">还没有登记节点。用 <code>deck nodes add --id hos --name "HOS 手机" --platform android</code> 添加。</div>';
     return;
   }
   box.innerHTML = nodes.map(n => `
@@ -499,7 +499,7 @@ let pendingReq = null;
 
 window.addEventListener('message', (e) => {
   const d = e.data || {};
-  if (d.type !== 'dsh-pagent:open-result' || !pendingReq) return;
+  if (d.type !== 'dsh-project-deck:open-result' || !pendingReq) return;
   if (d.project && d.project !== pendingReq.project) return;
   if (d.sessionId && pendingReq.sessionId && d.sessionId !== pendingReq.sessionId) return;
   clearTimeout(pendingReq.timer);
@@ -520,7 +520,7 @@ function sendToPlugin(payload){
     timer: setTimeout(() => {
       if (pendingReq && pendingReq.project === payload.project) {
         pendingReq = null;
-        toast('DSH 插件没有响应：确认 dsh-pagent 插件已加载（左下角 📋 按钮）', true);
+        toast('DSH 插件没有响应：确认 dsh-project-deck 插件已加载（左下角 📋 按钮）', true);
       }
     }, 2500),
   };
@@ -541,12 +541,12 @@ function enterProject(projectId){
   if (!p) return toast('项目不存在', true);
   const sid = p.sessions && p.sessions.length ? p.sessions[0].id : null;
   if (inPluginFrame()) {
-    sendToPlugin({ type: 'dsh-pagent:open-project', project: p.id, root: p.root, sessionId: sid });
+    sendToPlugin({ type: 'dsh-project-deck:open-project', project: p.id, root: p.root, sessionId: sid });
     toast(sid ? '正在打开最近会话…' : '该项目还没有会话，正在新建…');
   } else if (sid) {
-    openDeepLink('pagent-session=' + encodeURIComponent(sid));
+    openDeepLink('deck-session=' + encodeURIComponent(sid));
   } else {
-    openDeepLink('pagent-project=' + encodeURIComponent(p.root));
+    openDeepLink('deck-project=' + encodeURIComponent(p.root));
   }
 }
 
@@ -554,10 +554,10 @@ function enterProject(projectId){
 function openSession(projectId, sessionId){
   if (!sessionId) return toast('这个项目还没有会话', true);
   if (inPluginFrame()) {
-    sendToPlugin({ type: 'dsh-pagent:open-session', project: projectId, sessionId });
+    sendToPlugin({ type: 'dsh-project-deck:open-session', project: projectId, sessionId });
     toast('正在打开会话 ' + sessionId.replace(/^(session|mesh)-/, '').slice(0, 8) + '…');
   } else {
-    openDeepLink('pagent-session=' + encodeURIComponent(sessionId));
+    openDeepLink('deck-session=' + encodeURIComponent(sessionId));
   }
 }
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""个人 Agent 管理面板 —— 本地 Web 控制台。
+"""项目甲板 管理面板 —— 本地 Web 控制台。
 
-  python3 ~/.person-agent/bin/panel.py        # 默认 127.0.0.1:9199
-  PAGENT_PANEL_HOST=0.0.0.0 PAGENT_PANEL_PORT=9199 python3 panel.py
+  python3 ~/.project-deck/bin/panel.py        # 默认 127.0.0.1:9199
+  DECK_PANEL_HOST=0.0.0.0 DECK_PANEL_PORT=9199 python3 panel.py
 
-数据全部来自 ~/.person-agent（registry / config / report-state / 播报历史），
-与 pagent CLI、launchd 守护进程共用同一份真相，不另存一份。
+数据全部来自 ~/.project-deck（registry / config / report-state / 播报历史），
+与 deck CLI、launchd 守护进程共用同一份真相，不另存一份。
 """
 import glob
 import http.server
@@ -19,28 +19,31 @@ import threading
 import time
 import urllib.parse
 
-BASE = os.path.expanduser('~/.person-agent')
-PAGENT = os.path.join(BASE, 'bin', 'pagent')
+BASE = os.path.expanduser(os.environ.get('DECK_HOME', '~/.project-deck'))
+DECK_BIN = os.environ.get('DECK_BIN') or os.path.join(BASE, 'bin', 'deck')
+if not os.path.exists(DECK_BIN):
+    DECK_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deck')
+PAGENT = DECK_BIN
 HTML = os.path.join(BASE, 'panel.html')
 if not os.path.exists(HTML):
     HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel.html')
-PORT = int(os.environ.get('PAGENT_PANEL_PORT', '9199'))
-HOST = os.environ.get('PAGENT_PANEL_HOST', '127.0.0.1')
+PORT = int(os.environ.get('DECK_PANEL_PORT', '9199'))
+HOST = os.environ.get('DECK_PANEL_HOST', '127.0.0.1')
 
 KINDS = {'code': '代码', 'content': '内容', 'ops': '运维', 'life': '生活', 'research': '研究'}
 STATUSES = {'active': '活跃', 'paused': '暂停', 'blocked': '阻塞', 'archived': '归档'}
 
 
-def load_pagent():
+def load_deck():
     from importlib.machinery import SourceFileLoader
-    loader = SourceFileLoader('pagent', PAGENT)
-    spec = importlib.util.spec_from_loader('pagent', loader)
+    loader = SourceFileLoader('deck', PAGENT)
+    spec = importlib.util.spec_from_loader('deck', loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
 
 
-P = load_pagent()
+P = load_deck()
 
 
 # ── 数据汇总 ────────────────────────────────────────────────
@@ -708,7 +711,7 @@ def send_report():
 
 # ── HTTP ────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = 'pagent-panel/1.0'
+    server_version = 'deck-panel/1.0'
 
     def log_message(self, fmt, *args):
         pass
@@ -764,7 +767,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == '/api/nodes':
             return self._json({'ok': True, 'nodes': nodes_view()})
         if path == '/api/node/scanner.ps1':
-            fp = os.path.join(BASE, 'bin', 'pagent-node.ps1')
+            fp = os.path.join(BASE, 'bin', 'deck-node.ps1')
             if not os.path.isfile(fp):
                 return self._json({'ok': False, 'error': 'scanner 不存在'}, 404)
             body = open(fp, 'rb').read()
@@ -775,7 +778,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == '/api/node/scanner.js':
-            fp = os.path.join(BASE, 'bin', 'pagent-node.js')
+            fp = os.path.join(BASE, 'bin', 'deck-node.js')
             if not os.path.isfile(fp):
                 return self._json({'ok': False, 'error': 'scanner 不存在'}, 404)
             body = open(fp, 'rb').read()
@@ -786,7 +789,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == '/api/node/scanner.py':
-            fp = os.path.join(BASE, 'bin', 'pagent-node')
+            fp = os.path.join(BASE, 'bin', 'deck-node')
             if not os.path.isfile(fp):
                 return self._json({'ok': False, 'error': 'scanner 不存在'}, 404)
             body = open(fp, 'rb').read()

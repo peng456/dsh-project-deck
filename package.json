@@ -1,5 +1,5 @@
 {
-  "name": "dsh-pagent",
+  "name": "dsh-project-deck",
   "version": "0.1.0",
   "description": "DeepSeek Harness plugin: a personal project control panel — project registry, 4-hour WeChat reports (text + chart image), auto-discovery of new projects, and multi-node scanning.",
   "type": "module",
@@ -18,5 +18,5 @@
   "keywords": ["dsh", "deepseek-harness", "plugin", "project-management", "wechat", "dashboard"],
   "license": "MIT",
   "engines": { "node": ">=22.15" },
-  "repository": { "type": "git", "url": "https://github.com/peng456/dsh-pagent" }
+  "repository": { "type": "git", "url": "https://github.com/peng456/dsh-project-deck" }
 }
