@@ -31,8 +31,7 @@ python3 backend/deck demo          # 生成 4 个假项目，起面板
 
 ```bash
 # 1. 后端（CLI + 面板 + 定时器）
-npx dsh-project-deck install   2>/dev/null || ./install.sh
-# 或：git clone https://github.com/peng456/dsh-project-deck && cd dsh-project-deck && ./install.sh
+git clone https://github.com/peng456/dsh-project-deck && cd dsh-project-deck && ./install.sh
 
 # 2. DSH 插件（npm 或 GitHub 二选一）
 dsh plugin --profile desktop add dsh-project-deck
