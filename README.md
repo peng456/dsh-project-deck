@@ -53,15 +53,19 @@ cd dsh-pagent
 
 ### 2. Plugin
 
-Desktop app → **Plugins** page → install from local path `./lib`, or copy the package into your profile:
+From GitHub (no build step — `lib/` is committed):
 
 ```bash
-# desktop profile (path may differ on your machine)
-cp -R . ~/.dsh/profiles/desktop/node_modules/dsh-pagent
-# then add "dsh-pagent" to dsh.profile.bundles in ~/.dsh/profiles/desktop/package.json
+dsh plugin --profile desktop add github:peng456/dsh-pagent
 ```
 
+Or in the Desktop app: **Plugins** page → install `github:peng456/dsh-pagent`.
+Manual fallback: copy this repo into `~/.dsh/profiles/desktop/node_modules/dsh-pagent`
+and add `"dsh-pagent"` to `dsh.profile.bundles` in the profile's `package.json`.
+
 Restart DSH. A 📋 button appears bottom-left; `Cmd+R` reloads the client half.
+
+> npm publishing is not done yet — the package name `dsh-pagent` is reserved but no release exists.
 
 ## Usage
 
