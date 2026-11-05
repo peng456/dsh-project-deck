@@ -20,6 +20,9 @@
   h1 span{color:var(--accent)}
   .sub{color:var(--muted);font-size:12px;margin-top:4px}
   .pills{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .pill{cursor:default;user-select:none}
+  button.pill{cursor:pointer;font:inherit}
+  button.pill:hover{border-color:var(--accent-dim);color:#fff}
   .pill{display:inline-flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);
         border-radius:999px;padding:6px 12px;font-size:12px;color:var(--muted)}
   .pill b{color:var(--text);font-weight:600}
@@ -134,11 +137,42 @@
     </div>
     <div class="pills">
       <span class="pill"><i class="dot" id="dotDaemon"></i>守护进程 <b id="daemonText">…</b></span>
-      <span class="pill"><i class="dot" id="dotWx"></i>微信 <b id="wxText">…</b></span>
+      <button class="pill" id="wxPill" onclick="toggleWxPop(event)" title="通知渠道设置">
+        <i class="dot" id="dotWx"></i>微信 <b id="wxText">…</b> <span style="color:#6f7d8a">▾</span>
+      </button>
       <span class="pill">下次播报 <b id="nextText">…</b></span>
       <button class="ghost" onclick="refresh()">刷新</button>
     </div>
   </header>
+
+  <div id="wxPop" style="display:none;position:fixed;right:22px;top:60px;z-index:40;width:376px;
+       background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 18px 40px rgba(0,0,0,.45)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <i class="dot" id="wxDot2"></i>
+      <b style="font-size:13px;white-space:nowrap">通知渠道</b>
+      <span class="hint" style="flex:1;min-width:0;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" id="wxDetail"></span>
+    </div>
+    <select id="wxType" onchange="onWxTypeChange()" style="width:100%;font-size:12px;padding:5px 8px;height:30px;margin-bottom:8px">
+      <option value="ilink">内置微信（扫码）</option>
+      <option value="wxpush">wxpush 网关</option>
+      <option value="serverchan">ServerChan</option>
+      <option value="webhook">Webhook</option>
+      <option value="command">自定义命令</option>
+    </select>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="wxField" placeholder="" style="flex:1;min-width:0;height:30px;padding:5px 8px;font-size:12px;display:none">
+      <button class="ghost" id="wxSaveBtn" onclick="saveWx()" style="display:none;padding:5px 10px;font-size:12px;white-space:nowrap">保存</button>
+      <button class="ghost" id="wxLoginBtn" onclick="wxLogin()" style="display:none;padding:5px 10px;font-size:12px;white-space:nowrap">连接微信</button>
+      <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none;padding:5px 10px;font-size:12px;white-space:nowrap">断开</button>
+    </div>
+    <div class="hint" id="wxNote" style="display:none;margin-top:8px;font-size:12px;line-height:1.5"></div>
+    <div id="wxQrWrap" style="display:none;margin-top:12px">
+      <div style="display:flex;gap:12px;align-items:flex-start">
+        <img id="wxQr" style="width:126px;height:126px;border-radius:8px;background:#fff;padding:5px;flex:0 0 auto">
+        <div class="hint" style="font-size:12px;line-height:1.5">扫码确认后，<b>还要在微信里给这个 bot 发任意一句话</b>（iLink 需要你的来信才能主动推送）。二维码约 2 分钟过期，会自动刷新。</div>
+      </div>
+    </div>
+  </div>
 
   <div class="stats">
     <div class="stat"><div class="n" id="sTotal">-</div><div class="l">项目</div></div>
@@ -182,31 +216,6 @@
   <div id="imgBox" style="display:none;margin:0 0 18px">
     <img id="lastImg" style="width:100%;max-width:560px;border-radius:12px;border:1px solid var(--line);display:block">
     <div class="hint" id="imgHint" style="margin-top:6px"></div>
-  </div>
-
-  <div class="controls" id="wxBox" style="padding:5px 10px;gap:8px;min-height:0">
-    <i class="dot" id="wxDot"></i><b id="wxTitle" style="font-size:12px;color:var(--muted);font-weight:600">通知</b>
-    <select id="wxType" onchange="onWxTypeChange()" style="font-size:12px;padding:3px 6px;height:26px">
-      <option value="ilink">内置微信（扫码）</option>
-      <option value="wxpush">wxpush 网关</option>
-      <option value="serverchan">ServerChan</option>
-      <option value="webhook">Webhook</option>
-      <option value="command">自定义命令</option>
-    </select>
-    <input id="wxField" placeholder="" style="flex:1;min-width:120px;height:26px;padding:3px 8px;font-size:12px;display:none">
-    <button class="ghost" id="wxSaveBtn" onclick="saveWx()" style="display:none;padding:3px 10px;font-size:12px">保存</button>
-    <span class="hint" id="wxDetail" style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px"></span>
-    <button class="ghost" id="wxLoginBtn" onclick="wxLogin()" style="display:none;padding:3px 10px;font-size:12px">连接微信</button>
-    <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none;padding:3px 10px;font-size:12px">断开</button>
-  </div>
-  <div id="wxQrWrap" style="display:none;margin:-6px 0 18px;display:none">
-    <div style="display:flex;gap:14px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px">
-      <img id="wxQr" style="width:150px;height:150px;border-radius:8px;background:#fff;padding:6px">
-      <div>
-        <div style="color:#e6edf3;font-size:13px;margin-bottom:6px">用微信扫码连接</div>
-        <div class="hint">扫码确认后，<b>还要在微信里给这个 bot 发任意一句话</b>（iLink 需要你发一次消息才能主动推送）。二维码约 2 分钟过期，会自动刷新。</div>
-      </div>
-    </div>
   </div>
 
   <div class="controls" style="padding:9px 12px">
@@ -619,12 +628,23 @@ async function refreshWechat(){
     const dot = $('wxDot'); const title = $('wxTitle');
     if (dot) dot.className = 'dot ' + (WX.ok ? 'ok' : 'bad');
     if (title) title.textContent = WX.mode === 'ilink' ? '微信' : (WX.mode || '通知');
-    $('wxDetail').textContent = WX.detail || '';
+    const shortWx = WX.mode === 'ilink'
+      ? (WX.logged ? (WX.bot ? '已连接 · ' + WX.bot : '已连接') : '未连接')
+      : (WX.ok ? '已接通' : '未接通');
+    $('wxDetail').textContent = shortWx;
     const curType = (S && S.config && S.config.delivery && S.config.delivery.type) || WX.mode || 'ilink';
     if ($('wxType') && $('wxType').value !== curType) { $('wxType').value = curType; onWxTypeChange(); }
-    const needQr = WX.mode === 'ilink' && !WX.logged && WX.qrUrl;
+    const note = $('wxNote');
+    if (note) {
+      const isIlink = (curType === 'ilink');
+      note.style.display = isIlink ? 'block' : 'none';
+      if (isIlink) note.textContent = WX.mode === 'ilink' ? (WX.detail || '') : '切到「内置微信」后点「连接微信」扫码即可。';
+    }
+    const needQr = (WX.mode === 'ilink' || curType === 'ilink') && !WX.logged && WX.qrUrl;
     $('wxQrWrap').style.display = needQr ? 'block' : 'none';
     if (needQr) $('wxQr').src = '/api/wechat/qr.png?t=' + Date.now();
+
+    const dot2 = $('wxDot2'); if (dot2) dot2.className = 'dot ' + (WX.ok ? 'ok' : 'bad');
     updateWxButtons();
     if (WX.mode === 'ilink' && !WX.ok) {
       if (!wxTimer) wxTimer = setInterval(refreshWechat, 2500);
@@ -643,6 +663,18 @@ const WX_FIELD = {
   wxpush: ['url', 'wxpush 地址，默认 http://127.0.0.1:9098'],
   ilink: null,
 };
+
+function toggleWxPop(e){
+  if (e) e.stopPropagation();
+  const p = $('wxPop');
+  p.style.display = (p.style.display === 'block') ? 'none' : 'block';
+}
+document.addEventListener('click', (e) => {
+  const p = $('wxPop');
+  if (p && p.style.display === 'block' && !p.contains(e.target) && e.target.id !== 'wxPill' && !$('wxPill').contains(e.target)) {
+    p.style.display = 'none';
+  }
+});
 
 function updateWxButtons(){
   const type = $('wxType') ? $('wxType').value : 'wxpush';
