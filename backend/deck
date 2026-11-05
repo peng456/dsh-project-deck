@@ -1017,6 +1017,171 @@ def cmd_scan(argv):
 
 
 # ── 发送 ────────────────────────────────────────────────────
+# ── 内置微信通道（iLink，扫码即用）────────────────────────────
+WECHAT_STATE = os.path.join(BASE, 'wechat.json')
+WECHAT_QR = os.path.join(BASE, 'wechat-qr.png')
+ILINK_BASE = 'https://ilinkai.weixin.qq.com/ilink'
+
+
+def wechat_state():
+    return load_json(WECHAT_STATE, {})
+
+
+def save_wechat_state(d):
+    save_json(WECHAT_STATE, d)
+
+
+def _ilink_headers(token=None):
+    uin = base64.b64encode(str(secrets.randbelow(2**32)).encode()).decode()
+    h = {'Content-Type': 'application/json', 'AuthorizationType': 'ilink_bot_token',
+         'X-WECHAT-UIN': uin, 'iLink-App-Id': 'bot', 'iLink-App-ClientVersion': '132105'}
+    if token:
+        h['Authorization'] = f'Bearer {token}'
+    return h
+
+
+def _ilink_request(path, body=None, method='POST', params=None, token=None, timeout=30):
+    url = ILINK_BASE + path
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=_ilink_headers(token), method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or '{}')
+
+
+def _extract_ctx(data):
+    found = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == 'context_token' and isinstance(v, str) and v and 'ctx' not in found:
+                    found['ctx'] = v
+                if k in ('from_user_id', 'user_id', 'ilink_user_id') and isinstance(v, str) and v and 'uid' not in found:
+                    found['uid'] = v
+                walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+    walk(data)
+    return found.get('ctx'), found.get('uid')
+
+
+def wechat_qr_png(url):
+    """用本机 Python 生成二维码 PNG（面板运行在系统 Python 上，可能没有 qrcode 模块）。"""
+    for py in ('/usr/local/bin/python3', sys.executable, '/usr/bin/python3'):
+        try:
+            r = subprocess.run([py, '-c', 'import qrcode,sys;qrcode.make(sys.argv[1]).save(sys.argv[2])', url, WECHAT_QR],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0 and os.path.exists(WECHAT_QR):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wechat_start_login():
+    r = _ilink_request('/bot/get_bot_qrcode', method='GET', params={'bot_type': 3})
+    ticket = r.get('qrcode') or r.get('qrcode_id')
+    url = r.get('qrcode_img_content') or r.get('qrcode_url') or r.get('url')
+    st = wechat_state()
+    st.update({'qr_ticket': ticket, 'qr_url': url, 'qr_at': time.time(),
+               'bot_token': None, 'context_token': None, 'last_error': None})
+    save_wechat_state(st)
+    if url:
+        wechat_qr_png(url)
+    return st
+
+
+def wechat_check_login():
+    st = wechat_state()
+    ticket = st.get('qr_ticket')
+    if not ticket:
+        return {'status': 'none'}
+    try:
+        r = _ilink_request('/bot/get_qrcode_status', method='GET', params={'qrcode': ticket}, timeout=15)
+    except Exception as e:
+        st['last_error'] = f'扫码状态查询失败: {e}'
+        save_wechat_state(st)
+        return {'status': 'error', 'error': str(e)}
+    status = str(r.get('status') or '')
+    if status == 'confirmed':
+        token = r.get('bot_token')
+        uid = r.get('ilink_user_id')
+        st.update({'bot_token': token, 'user_id': uid, 'authorized_at': time.time(),
+                   'qr_ticket': None, 'qr_url': None, 'last_error': None})
+        save_wechat_state(st)
+        log('[wechat] 扫码授权成功')
+        return {'status': 'confirmed'}
+    if status == 'expired':
+        wechat_start_login()
+        return {'status': 'expired'}
+    return {'status': status or 'wait'}
+
+
+def wechat_poll_once(timeout=60):
+    st = wechat_state()
+    token = st.get('bot_token')
+    if not token:
+        return
+    body = {'timeout': timeout, 'limit': 100,
+            'get_updates_buf': st.get('updates_buf') or '',
+            'base_info': {'channel_version': '1.0.0'}}
+    try:
+        r = _ilink_request('/bot/getupdates', body, token=token, timeout=timeout + 10)
+    except Exception:
+        return
+    ctx, uid = _extract_ctx(r)
+    if r.get('get_updates_buf'):
+        st['updates_buf'] = r.get('get_updates_buf')
+    if ctx:
+        st['context_token'] = ctx
+        log('[wechat] 捕获 context_token，可主动推送')
+    if uid:
+        st['user_id'] = uid
+    save_wechat_state(st)
+
+
+def wechat_send_text(text):
+    st = wechat_state()
+    token = st.get('bot_token')
+    ctx = st.get('context_token')
+    uid = st.get('user_id')
+    if not token:
+        return 2, '微信未登录：请在面板扫码'
+    if not ctx:
+        return 2, '缺少 context_token：请在微信里给 bot 发一条消息'
+    body = {'msg': {'from_user_id': '', 'to_user_id': uid or '',
+                    'client_id': f'deck:{int(time.time())}:{secrets.randbelow(999999)}',
+                    'message_type': 2, 'message_state': 2, 'context_token': ctx,
+                    'item_list': [{'type': 1, 'text_item': {'text': text}}]},
+            'base_info': {'channel_version': '1.0.0'}}
+    try:
+        r = _ilink_request('/bot/sendmessage', body, token=token, timeout=25)
+    except Exception as e:
+        return 3, f'微信发送失败: {e}'
+    if r.get('message_id'):
+        return 0, '已送达（微信）'
+    if r.get('ret', 0) == -2:
+        return 2, 'context_token 失效：请在微信里给 bot 发一条消息'
+    return 2, f'未被投递: {str(r)[:120]}'
+
+
+def wechat_status():
+    st = wechat_state()
+    logged = bool(st.get('bot_token'))
+    has_ctx = bool(st.get('context_token'))
+    return {'logged': logged, 'hasContext': has_ctx,
+            'qrUrl': st.get('qr_url') if not logged else None,
+            'qrAt': st.get('qr_at') if not logged else None,
+            'authorizedAt': st.get('authorized_at'),
+            'lastError': st.get('last_error'),
+            'detail': ('微信已连接，可主动推送' if logged and has_ctx else
+                       ('微信已扫码，但还没收到你的消息（去给 bot 发一句）' if logged else
+                        ('等待扫码' if st.get('qr_url') else '未连接：点「连接微信」生成二维码')))}
+
+
 def delivery_cfg(cfg=None):
     cfg = cfg or load_json(CONFIG, {})
     d = (cfg.get('report') or {}).get('delivery') or {}
@@ -1042,6 +1207,8 @@ def delivery_send(text):
     d = delivery_cfg()
     t = d['type']
     try:
+        if t == 'ilink':
+            return wechat_send_text(text)
         if t == 'wxpush':
             if not d['url']:
                 return 3, 'wxpush url 未配置'
@@ -1086,6 +1253,11 @@ def delivery_status():
     d = delivery_cfg()
     out = {'type': d['type'], 'ok': False, 'detail': '', 'pending': 0}
     try:
+        if d['type'] == 'ilink':
+            w = wechat_status()
+            out['ok'] = bool(w['logged'] and w['hasContext'])
+            out['detail'] = w['detail']
+            return out
         if d['type'] == 'wxpush':
             with urllib.request.urlopen(d['url'] + '/health', timeout=5) as r:
                 j = json.loads(r.read().decode() or '{}')
@@ -1220,7 +1392,7 @@ def do_report_with_image(cfg, quiet=False, force=None):
     """播报（文字）+ 可选附图；force=True/False 覆盖 config，None 跟随 config。"""
     code, text, msg = do_report(cfg, quiet)
     want = cfg.get('report', {}).get('image') if force is None else force
-    if delivery_cfg(cfg)['type'] != 'wxpush':
+    if delivery_cfg(cfg)['type'] not in ('wxpush', 'ilink'):
         want = False
     if code == 0 and want:
         try:
@@ -1246,6 +1418,9 @@ GRAPHICS = os.path.join(BASE, 'graphics')
 
 
 def _wx_state():
+    if delivery_cfg()['type'] == 'ilink':
+        st = wechat_state()
+        return st.get('bot_token'), st.get('context_token'), st.get('user_id'), ILINK_BASE
     st = load_json(WXPUSH_STATE, {})
     return st.get('bot_token'), st.get('context_token'), st.get('ilink_user_id'), \
         (st.get('api_base') or 'https://ilinkai.weixin.qq.com/ilink')
@@ -1293,7 +1468,7 @@ def flush_pending_image():
     p = load_json(PENDING_IMG, None)
     if not p:
         return False
-    if delivery_cfg()['type'] != 'wxpush':
+    if delivery_cfg()['type'] not in ('wxpush', 'ilink'):
         return False
     if channel_stale():
         return False
@@ -1739,6 +1914,25 @@ def cmd_daemon():
         time.sleep(30)
 
 
+def cmd_wechat(argv):
+    action = argv[0] if argv else 'status'
+    if action == 'login':
+        st = wechat_start_login()
+        print('二维码链接:', st.get('qr_url'))
+        print('二维码图片:', WECHAT_QR if os.path.exists(WECHAT_QR) else '(生成失败，可用链接自行转二维码)')
+        print('扫码后运行: deck wechat status')
+        return 0
+    if action == 'logout':
+        save_wechat_state({})
+        print('已清除微信登录态')
+        return 0
+    w = wechat_status()
+    print(f"微信: {w['detail']}")
+    if w.get('qrUrl'):
+        print('二维码:', w['qrUrl'])
+    return 0
+
+
 def cmd_demo(argv):
     """deck demo：生成一个演示环境（假项目 + 独立面板端口），不碰真实注册表。"""
     import shutil
@@ -1837,6 +2031,8 @@ def main():
         return cmd_approvals(rest)
     if cmd == 'decisions':
         return cmd_decisions(rest)
+    if cmd == 'wechat':
+        return cmd_wechat(rest)
     if cmd == 'demo':
         return cmd_demo(rest)
     if cmd == 'panel':

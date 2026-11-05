@@ -47,6 +47,26 @@ P = load_deck()
 
 
 # ── 数据汇总 ────────────────────────────────────────────────
+def wechat_view():
+    d = P.delivery_cfg()
+    if d['type'] == 'ilink':
+        P.wechat_check_login() if P.wechat_state().get('qr_ticket') else None
+        return {'mode': 'ilink', **P.wechat_status()}
+    st = P.delivery_status()
+    return {'mode': d['type'], **st}
+
+
+def wechat_poller():
+    while True:
+        try:
+            if P.delivery_cfg()['type'] == 'ilink' and P.wechat_state().get('bot_token'):
+                P.wechat_poll_once(50)
+            else:
+                time.sleep(4)
+        except Exception:
+            time.sleep(5)
+
+
 def wechat_state():
     st = P.delivery_status()
     return {'ok': bool(st.get('ok')), 'raw': st.get('detail', ''),
@@ -102,6 +122,7 @@ def snapshot():
                    'format': rep.get('format', 'markdown'),
                    'image': bool(rep.get('image', False)),
                    'web': cfg.get('web', {}).get('baseUrl', 'http://127.0.0.1:43120'),
+                   'delivery': P.delivery_cfg(cfg),
                    'scan': cfg.get('scan', {})},
         'daemon': {'running': bool(P.daemon_status()), 'pid': P.daemon_status() or 0,
                    'lastRun': last, 'nextRun': (last + interval * 3600) if last else 0},
@@ -566,6 +587,11 @@ def set_config(payload):
         rep['maxChars'] = int(payload['maxChars'])
     if 'image' in payload:
         rep['image'] = bool(payload['image'])
+    if 'delivery' in payload and isinstance(payload['delivery'], dict):
+        dl = rep.setdefault('delivery', {})
+        for k in ('type', 'url', 'key', 'webhook', 'command'):
+            if k in payload['delivery']:
+                dl[k] = payload['delivery'][k]
     if 'scan' in payload and isinstance(payload['scan'], dict):
         sc = cfg.setdefault('scan', {})
         for k in ('enabled', 'autoAdd'):
@@ -785,6 +811,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({'ok': False, 'error': 'forbidden'}, 403)
         if path in ('/', '/index.html'):
             return self._html(HTML)
+        if path == '/api/wechat':
+            return self._json({'ok': True, 'wechat': wechat_view()})
+        if path == '/api/wechat/qr.png':
+            fp = P.WECHAT_QR
+            if not os.path.isfile(fp):
+                return self._json({'ok': False, 'error': '二维码尚未生成'}, 404)
+            body = open(fp, 'rb').read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == '/icons':
+            fp = os.path.join(BASE, 'icons.html')
+            if not os.path.isfile(fp):
+                return self._json({'ok': False, 'error': 'icons.html 不存在'}, 404)
+            body = open(fp, 'rb').read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path in ('/api/node/scanner.py', '/api/node/scanner.js', '/api/node/scanner.ps1'):
+            pass
         if path == '/api/state':
             try:
                 return self._json(snapshot())
@@ -891,6 +944,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({'ok': False, 'error': '请求体不是合法 JSON'}, 400)
 
         try:
+            if path == '/api/wechat/login':
+                P.wechat_start_login()
+                return self._json({'ok': True, 'wechat': wechat_view()})
+            if path == '/api/wechat/logout':
+                P.save_wechat_state({})
+                return self._json({'ok': True, 'wechat': wechat_view()})
             if path == '/api/autonomy':
                 return self._json({'ok': True, 'state': set_autonomy(payload.get('project'), payload.get('mode'), payload.get('maxPerDay'))})
             if path == '/api/approval':
@@ -939,6 +998,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     import threading
     threading.Thread(target=lambda: session_index(), daemon=True).start()  # 预热会话索引
+    threading.Thread(target=wechat_poller, daemon=True).start()  # 微信内置通道轮询
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     P.log(f'[panel] listening http://{HOST}:{PORT}')
     try:

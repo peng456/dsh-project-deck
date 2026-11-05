@@ -184,6 +184,31 @@
     <div class="hint" id="imgHint" style="margin-top:6px"></div>
   </div>
 
+  <div class="controls" id="wxBox" style="padding:10px 12px">
+    <span class="pill" style="margin:0"><i class="dot" id="wxDot"></i><b id="wxTitle">通知渠道</b></span>
+    <select id="wxType" onchange="onWxTypeChange()" style="font-size:12px;padding:5px 8px">
+      <option value="ilink">内置微信（扫码）</option>
+      <option value="wxpush">wxpush 网关</option>
+      <option value="serverchan">ServerChan</option>
+      <option value="webhook">Webhook</option>
+      <option value="command">自定义命令</option>
+    </select>
+    <input id="wxField" placeholder="" style="flex:1;min-width:160px;display:none">
+    <button class="ghost" id="wxSaveBtn" onclick="saveWx()" style="display:none">保存</button>
+    <span class="hint" id="wxDetail"></span>
+    <button class="ghost" id="wxLoginBtn" onclick="wxLogin()" style="display:none">连接微信</button>
+    <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none">断开</button>
+  </div>
+  <div id="wxQrWrap" style="display:none;margin:-6px 0 18px;display:none">
+    <div style="display:flex;gap:14px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px">
+      <img id="wxQr" style="width:150px;height:150px;border-radius:8px;background:#fff;padding:6px">
+      <div>
+        <div style="color:#e6edf3;font-size:13px;margin-bottom:6px">用微信扫码连接</div>
+        <div class="hint">扫码确认后，<b>还要在微信里给这个 bot 发任意一句话</b>（iLink 需要你发一次消息才能主动推送）。二维码约 2 分钟过期，会自动刷新。</div>
+      </div>
+    </div>
+  </div>
+
   <div class="controls" style="padding:9px 12px">
     <input id="q" placeholder="搜索项目（名称 / id / 路径 / 说明）" style="flex:1;min-width:180px" oninput="render()">
     <select id="fStatus" onchange="render()">
@@ -579,6 +604,67 @@ function sendToPlugin(payload){
       }
     }, 2500),
   };
+}
+
+let WX = null, wxTimer = null;
+
+async function refreshWechat(){
+  try{
+    const r = await fetch('/api/wechat'); const j = await r.json();
+    WX = j.wechat || {};
+    const dot = $('wxDot'); const title = $('wxTitle');
+    if (dot) dot.className = 'dot ' + (WX.ok ? 'ok' : 'bad');
+    if (title) title.textContent = WX.mode === 'ilink' ? '微信' : (WX.mode || '通知');
+    $('wxDetail').textContent = WX.detail || '';
+    const curType = (S && S.config && S.config.delivery && S.config.delivery.type) || WX.mode || 'ilink';
+    if ($('wxType') && $('wxType').value !== curType) { $('wxType').value = curType; onWxTypeChange(); }
+    const needQr = WX.mode === 'ilink' && !WX.logged && WX.qrUrl;
+    $('wxQrWrap').style.display = needQr ? 'block' : 'none';
+    if (needQr) $('wxQr').src = '/api/wechat/qr.png?t=' + Date.now();
+    $('wxLoginBtn').style.display = (WX.mode === 'ilink' && !WX.logged) ? '' : 'none';
+    $('wxLogoutBtn').style.display = (WX.mode === 'ilink' && WX.logged) ? '' : 'none';
+    if (WX.mode === 'ilink' && !WX.ok) {
+      if (!wxTimer) wxTimer = setInterval(refreshWechat, 2500);
+    } else if (wxTimer) { clearInterval(wxTimer); wxTimer = null; }
+    if (S && S.wechat) { S.wechat.ok = WX.ok; render(); }
+  }catch(e){ /* 忽略 */ }
+}
+
+async function wxLogin(){ try{ await api('/api/wechat/login', {}); refreshWechat(); }catch(e){ toast('生成二维码失败：' + e.message, true); } }
+async function wxLogout(){ try{ await api('/api/wechat/logout', {}); refreshWechat(); toast('已断开微信'); }catch(e){ toast('断开失败：' + e.message, true); } }
+
+const WX_FIELD = {
+  serverchan: ['key', 'ServerChan SendKey（SCT...）'],
+  webhook: ['webhook', 'webhook URL（企业微信机器人等）'],
+  command: ['command', '命令（stdin 收文本，退出码 0=成功）'],
+  wxpush: ['url', 'wxpush 地址，默认 http://127.0.0.1:9098'],
+  ilink: null,
+};
+
+function onWxTypeChange(){
+  const type = $('wxType').value;
+  const f = WX_FIELD[type];
+  $('wxField').style.display = f ? '' : 'none';
+  $('wxSaveBtn').style.display = f ? '' : 'none';
+  if (f) {
+    const cur = (S && S.config && S.config.delivery) || {};
+    $('wxField').placeholder = f[1];
+    $('wxField').value = cur[f[0]] || '';
+  }
+  const isIlink = type === 'ilink';
+  $('wxLoginBtn').style.display = isIlink ? '' : 'none';
+  $('wxLogoutBtn').style.display = 'none';
+}
+
+async function saveWx(){
+  const type = $('wxType').value;
+  const f = WX_FIELD[type];
+  if (!f) return;
+  const delivery = { type, [f[0]]: $('wxField').value.trim() };
+  try{
+    const r = await api('/api/config', { delivery });
+    S = r.state; render(); refreshWechat(); toast('通知渠道已更新');
+  }catch(e){ toast('保存失败：' + e.message, true); }
 }
 
 function setFabPos(pos){

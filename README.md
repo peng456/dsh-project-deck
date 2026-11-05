@@ -67,9 +67,21 @@ deck demo                 # 演示环境
 无变化：官网改版、基础设施、…
 ```
 
-## 通知渠道（可选，默认 wxpush）
+## 通知渠道（可选）
 
-播报通过 `report.delivery` 选择发送器，**不带任何内置账号**：
+播报通过 `report.delivery` 选择发送器，**默认不依赖任何外部服务**：
+
+| 类型 | 说明 |
+|---|---|
+| `ilink` | **内置微信连接**：面板点「连接微信」→ 扫码 → 在微信里给 bot 发一句话即可推送，不需要额外服务 |
+| `wxpush` | 复用本机 [wxpush](https://github.com/) 网关（支持附图） |
+| `serverchan` | ServerChan SendKey |
+| `webhook` | 任意 URL（企业微信机器人等） |
+| `command` | 自写脚本，stdin 收文本，退出码 0 = 成功 |
+
+面板顶部有「通知渠道」下拉，选完保存即可；`ilink` 模式下会直接显示二维码。
+
+```jsonc
 
 ```jsonc
 "report": {
@@ -77,7 +89,7 @@ deck demo                 # 演示环境
   "image": false,                          // 附图仅 wxpush 通道支持
   "delivery": {
     "type": "wxpush",                      // wxpush | serverchan | webhook | command
-    "url": "http://127.0.0.1:9098",        // wxpush
+    "url": "http://127.0.0.1:9098",        // wxpush（ilink 模式忽略）
     "key": "",                             // ServerChan SendKey
     "webhook": "",                         // 任意 webhook（企业微信机器人等）
     "command": ""                          // 自写脚本：stdin 收文本，退出码 0 = 成功
