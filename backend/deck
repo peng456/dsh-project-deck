@@ -174,6 +174,190 @@ def session_activity(root):
     return latest
 
 
+def autonomy_of(p):
+    a = p.get('autonomy') or {}
+    mode = a.get('mode', 'off')
+    if mode not in AUTONOMY_MODES:
+        mode = 'off'
+    return {'mode': mode, 'maxPerDay': int(a.get('maxPerDay', 3)),
+            'day': a.get('day', ''), 'actionsToday': int(a.get('actionsToday', 0))}
+
+
+def _today():
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def can_act(p):
+    a = autonomy_of(p)
+    if a['mode'] == 'off':
+        return False, 'off'
+    if a['day'] != _today():
+        return a['mode'] != 'off', 'new-day'
+    if a['actionsToday'] >= a['maxPerDay']:
+        return False, f"预算用尽（{a['actionsToday']}/{a['maxPerDay']}）"
+    return True, 'ok'
+
+
+def bump_actions(pid):
+    reg = load_json(REGISTRY, {'projects': []})
+    for p in reg['projects']:
+        if p['id'] == pid:
+            a = autonomy_of(p)
+            if a['day'] != _today():
+                a['day'] = _today(); a['actionsToday'] = 0
+            a['actionsToday'] += 1
+            p['autonomy'] = a
+    save_json(REGISTRY, reg)
+
+
+def record_decision(pid, question, options, choice, why, reversible=True, mode=None):
+    entry = {'at': time.time(), 'project': pid, 'question': question,
+             'options': options, 'choice': choice, 'why': why,
+             'reversible': bool(reversible), 'mode': mode or ''}
+    with open(DECISIONS, 'a') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    log(f'[autonomy] decision {pid}: {choice} ({question[:40]})')
+    return entry
+
+
+def load_approvals():
+    return load_json(APPROVALS, {'items': []})
+
+
+def add_approval(pid, question, options, recommend='', irreversible=True):
+    d = load_approvals()
+    item = {'id': 'ap-' + secrets.token_hex(4), 'project': pid, 'question': question,
+            'options': options, 'recommend': recommend, 'irreversible': bool(irreversible),
+            'createdAt': time.time(), 'status': 'pending'}
+    d.setdefault('items', []).append(item)
+    save_json(APPROVALS, d)
+    log(f'[autonomy] approval {item["id"]} {pid}: {question[:50]}')
+    return item
+
+
+def resolve_approval(aid, decision, choice='', why=''):
+    d = load_approvals()
+    for it in d.get('items', []):
+        if it['id'] == aid and it['status'] == 'pending':
+            it['status'] = 'approved' if decision == 'approve' else 'rejected'
+            it['resolvedAt'] = time.time()
+            it['humanChoice'] = choice or it.get('recommend', '')
+            if why:
+                it['note'] = why
+            save_json(APPROVALS, d)
+            record_decision(it['project'], it['question'], it.get('options', []),
+                            it['humanChoice'] if decision == 'approve' else 'rejected',
+                            'human: ' + (why or decision), True, 'human')
+            return it
+    return None
+
+
+def cmd_autonomy(argv):
+    if not argv:
+        reg = load_json(REGISTRY, {'projects': []})
+        rows = [(p['id'], autonomy_of(p)) for p in reg['projects']]
+        for pid, a in rows:
+            print(f"{pid:22} {a['mode']:7} 今日 {a['actionsToday']}/{a['maxPerDay']}")
+        return 0
+    pid = argv[0]
+    reg = load_json(REGISTRY, {'projects': []})
+    proj = next((p for p in reg['projects'] if p['id'] == pid), None)
+    if not proj:
+        print('项目不存在'); return 1
+    if len(argv) < 2:
+        a = autonomy_of(proj); print(f"{pid}: {a['mode']} 今日 {a['actionsToday']}/{a['maxPerDay']}"); return 0
+    mode = argv[1]
+    if mode not in AUTONOMY_MODES:
+        print('模式只能是 off / assist / auto'); return 1
+    a = autonomy_of(proj)
+    a['mode'] = mode
+    if '--max' in argv:
+        try: a['maxPerDay'] = int(argv[argv.index('--max') + 1])
+        except (IndexError, ValueError): pass
+    proj['autonomy'] = a
+    save_json(REGISTRY, reg)
+    print(f"{pid}: 自主模式 → {mode}（每日上限 {a['maxPerDay']}）")
+    return 0
+
+
+def cmd_decide(argv):
+    if not argv:
+        print('用法: deck decide <id> --question Q --options A|B|C --choice B --why "..." [--irreversible]')
+        return 1
+    pid = argv[0]
+    opts = {}
+    i = 1
+    while i < len(argv):
+        if argv[i].startswith('--') and i + 1 < len(argv):
+            opts[argv[i][2:]] = argv[i + 1]; i += 2
+        else: i += 1
+    q = opts.get('question', ''); choice = opts.get('choice', '')
+    if not q or not choice:
+        print('缺少 --question / --choice'); return 1
+    record_decision(pid, q, opts.get('options', ''), choice, opts.get('why', ''),
+                    not ('irreversible' in opts or '--irreversible' in argv))
+    bump_actions(pid)
+    print('已记录决策')
+    return 0
+
+
+def cmd_ask(argv):
+    if not argv:
+        print('用法: deck ask <id> --question Q --options A,B [--recommend A]')
+        return 1
+    pid = argv[0]; opts = {}
+    i = 1
+    while i < len(argv):
+        if argv[i].startswith('--') and i + 1 < len(argv):
+            opts[argv[i][2:]] = argv[i + 1]; i += 2
+        else: i += 1
+    q = opts.get('question', '')
+    if not q: print('缺少 --question'); return 1
+    it = add_approval(pid, q, opts.get('options', ''), opts.get('recommend', ''))
+    print('已加入审批队列:', it['id'])
+    return 0
+
+
+def cmd_approvals(argv):
+    d = load_approvals()
+    pend = [x for x in d.get('items', []) if x.get('status') == 'pending']
+    if not argv:
+        if not pend: print('没有待批事项'); return 0
+        for x in pend:
+            age = rel_time(x['createdAt'])
+            print(f"{x['id']}  {x['project']:18} {age:8}  {x['question'][:60]}")
+            if x.get('options'): print('      选项:', x['options'], '| 推荐:', x.get('recommend') or '-')
+        return 0
+    if argv[0] in ('--approve', '--reject') and len(argv) > 1:
+        aid = argv[1]
+        choice = ''
+        if '--choice' in argv: choice = argv[argv.index('--choice') + 1]
+        why = ''
+        if '--why' in argv: why = argv[argv.index('--why') + 1]
+        it = resolve_approval(aid, 'approve' if argv[0] == '--approve' else 'reject', choice, why)
+        print('已处理' if it else '找不到该待批项')
+        return 0
+    print('用法: deck approvals [--approve ID [--choice X] | --reject ID [--why "..."]]')
+    return 1
+
+
+def cmd_decisions(argv):
+    limit = 20
+    if '--limit' in argv:
+        try: limit = int(argv[argv.index('--limit') + 1])
+        except (IndexError, ValueError): pass
+    if not os.path.exists(DECISIONS):
+        print('还没有决策记录'); return 0
+    rows = []
+    for line in open(DECISIONS):
+        try: rows.append(json.loads(line))
+        except json.JSONDecodeError: pass
+    for r in rows[-limit:]:
+        flag = '' if r.get('reversible', True) else ' [不可逆]'
+        print(f"{datetime.fromtimestamp(r['at']):%m-%d %H:%M}  {r['project']:18} {r['choice']}{flag}  ← {r['question'][:50]}")
+    return 0
+
+
 def in_quiet(cfg, ts=None):
     q = (cfg.get('schedule') or {}).get('quiet') or {}
     start, end = q.get('from'), q.get('to')
@@ -412,6 +596,21 @@ def build_report(cfg):
         if added or cands:
             lines.append('')
 
+    # 等你拍板 + 自主推进概览
+    pend = [x for x in load_approvals().get('items', []) if x.get('status') == 'pending']
+    if pend:
+        lines.append(f'**等你拍板**：{len(pend)} 项')
+        for x in pend[:3]:
+            opts = f"（{x['options']}，推荐 {x.get('recommend') or '-'}）" if x.get('options') else ''
+            lines.append(f"- {x['project']}：{x['question'][:50]}{opts}")
+        lines.append('')
+    modes = {'auto': 0, 'assist': 0, 'off': 0}
+    for p in projects:
+        modes[autonomy_of(p)['mode']] = modes.get(autonomy_of(p)['mode'], 0) + 1
+    if modes['auto'] or modes['assist']:
+        lines.append(f"自主推进：auto {modes['auto']} · assist {modes['assist']} · off {modes['off']}")
+        lines.append('')
+
     # 节点离线提醒（超过 3 天没上报）
     try:
         off = []
@@ -455,6 +654,9 @@ def build_report(cfg):
 WS_STORE = os.path.join(HOME, '.dsh', 'storages', 'workspace.json')
 SCAN_STATE = os.path.join(BASE, 'scan-state.json')
 SCAN_IGNORE = os.path.join(BASE, 'scan-ignore.json')
+DECISIONS = os.path.join(BASE, 'decisions.jsonl')
+APPROVALS = os.path.join(BASE, 'approvals.json')
+AUTONOMY_MODES = ('off', 'assist', 'auto')
 NODES = os.path.join(BASE, 'nodes.json')
 NODE_SNAPS = os.path.join(BASE, 'nodes')
 
@@ -1376,6 +1578,9 @@ def cmd_status():
     print(f"周期播报: {'开启' if r.get('enabled', True) else '关闭'}，每 {r.get('intervalHours', 4)} 小时，"
           f"版式 {r.get('format', 'markdown')}，{'附图' if r.get('image') else '不附图'}")
     print(f"守护进程: {'运行中 pid ' + str(pid) if pid else '未运行'}")
+    pend_count = len([x for x in load_approvals().get('items', []) if x.get('status') == 'pending'])
+    if pend_count:
+        print(f"待批事项: {pend_count} 个")
     sc = load_json(SCAN_STATE, {})
     if sc.get('lastRun'):
         print(f"自动发现: 上次扫描 {datetime.fromtimestamp(sc['lastRun']):%m-%d %H:%M}"
@@ -1529,6 +1734,16 @@ def main():
         st['last_run'] = time.time()
         save_json(STATE, st)
         return code
+    if cmd == 'autonomy':
+        return cmd_autonomy(rest)
+    if cmd == 'decide':
+        return cmd_decide(rest)
+    if cmd == 'ask':
+        return cmd_ask(rest)
+    if cmd == 'approvals':
+        return cmd_approvals(rest)
+    if cmd == 'decisions':
+        return cmd_decisions(rest)
     if cmd == 'demo':
         return cmd_demo(rest)
     if cmd == 'panel':

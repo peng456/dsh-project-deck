@@ -186,6 +186,11 @@
     <span class="hint" id="filterHint"></span>
   </div>
 
+  <div id="approvalsBox" style="display:none">
+    <h2>等你拍板 <span class="hint" id="apCount"></span></h2>
+    <div class="history" id="approvalsList"></div>
+  </div>
+
   <div class="grid" id="grid"></div>
 
   <details class="add">
@@ -341,6 +346,44 @@ function render(){
   if (!scanFormLoaded && S.config.scan) { loadConfigIntoForm(); }
   renderHistory();
   renderNodes();
+  renderApprovals();
+}
+
+function renderApprovals(){
+  const box = $('approvalsBox');
+  if (!box) return;
+  const items = S.approvals || [];
+  box.style.display = items.length ? 'block' : 'none';
+  if (!items.length) return;
+  $('apCount').textContent = items.length + ' 项';
+  $('approvalsList').innerHTML = items.map(x => `
+    <div class="hist">
+      <div class="top">
+        <span><span class="chip teal">${esc(x.project)}</span> ${esc(relText(x.createdAt))}</span>
+        <span style="display:flex;gap:6px">
+          <button style="font-size:11px;padding:2px 9px" onclick="resolveAp('${esc(x.id)}','approve','${esc(x.recommend || '')}')">采纳${x.recommend ? '推荐 ' + esc(x.recommend) : ''}</button>
+          <button class="danger" style="font-size:11px;padding:2px 9px" onclick="resolveAp('${esc(x.id)}','reject','')">拒绝</button>
+        </span>
+      </div>
+      <div style="margin-top:6px;color:#cfd9e3;font-size:12.5px">${esc(x.question)}</div>
+      ${x.options ? `<div class="hint" style="margin-top:4px">选项：${esc(x.options)}${x.recommend ? ' · 推荐 ' + esc(x.recommend) : ''}</div>` : ''}
+    </div>`).join('');
+}
+
+async function setAutonomy(id, mode){
+  try{
+    const r = await api('/api/autonomy', {project: id, mode});
+    S = r.state; render();
+    toast('自主模式 → ' + mode);
+  }catch(e){ toast('设置失败：' + e.message, true); }
+}
+
+async function resolveAp(id, action, choice){
+  try{
+    const r = await api('/api/approval', {id, action, choice});
+    S = r.state; render();
+    toast(action === 'approve' ? '已采纳' : '已拒绝');
+  }catch(e){ toast('处理失败：' + e.message, true); }
 }
 
 function renderNodes(){
@@ -381,6 +424,8 @@ function cardHtml(p){
   const board = p.board && p.board.total ? `<span class="chip">看板 ${p.board.total}</span>` : '<span class="chip">无看板</span>';
   const git = p.git ? `<span class="chip">git ${esc(p.git.sha)}${p.git.dirty ? ' <b style="color:var(--warn)">+' + p.git.dirty + '</b>' : ''}</span>` : '';
   const missing = p.exists ? '' : '<span class="chip bad">目录缺失</span>';
+  const aut = (p.autonomy && p.autonomy.mode) || 'off';
+  const autChip = `<span class="chip ${aut === 'auto' ? 'teal' : (aut === 'assist' ? 'warn' : '')}">🤖 ${aut}</span>`;
   const next = p.next || '<span style="color:var(--muted)">（未登记进展）</span>';
   return `<div class="card ${st}" id="card-${esc(p.id)}">
     <div class="cardhead">
@@ -389,13 +434,16 @@ function cardHtml(p){
       <button class="enter" onclick="enterProject('${esc(p.id)}')"
         title="${p.sessions && p.sessions.length ? '进入该项目最近一次会话' : '该项目还没有会话，点击新建一个'}">💬 进入会话</button>
     </div>
-    <div class="chips">${kind}${statusChip(p)}${mem}${board}${git}${missing}</div>
+    <div class="chips">${kind}${statusChip(p)}${autChip}${mem}${board}${git}${missing}</div>
     <div class="next">下一步：${esc(p.next || '（未登记进展）')}</div>
     <div class="row"><span class="k">最近活动</span><span class="v">${esc(p.activityText)}</span></div>
     <div class="row"><span class="k">根目录</span><span class="v">${esc(p.root)}</span></div>
     ${p.note ? `<div class="row"><span class="k">说明</span><span class="v">${esc(p.note)}</span></div>` : ''}
     <footer>
       <button onclick="openDetail('${esc(p.id)}')" title="项目详情（会话列表 / git / 看板 / STATE）">详情</button>
+      <select onchange="setAutonomy('${esc(p.id)}', this.value)" title="自主推进模式" style="font-size:12px;padding:5px 8px">
+        ${['off','assist','auto'].map(m => `<option value="${m}" ${aut===m?'selected':''}>🤖 ${m}</option>`).join('')}
+      </select>
       <select onchange="setStatus('${esc(p.id)}', this.value)" style="font-size:12px;padding:5px 8px">
         ${['active','paused','blocked','archived'].map(s => `<option value="${s}" ${p.status===s?'selected':''}>${statusName(s)}</option>`).join('')}
       </select>

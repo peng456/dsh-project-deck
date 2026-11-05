@@ -68,6 +68,7 @@ def project_view(p):
         'exists': info['exists'], 'memory': info['memory'],
         'activity': info['activity'], 'activityText': P.rel_time(info['activity']),
         'git': info['git'], 'board': info['board'],
+        'autonomy': P.autonomy_of(p),
         'sessions': project_sessions(p.get('root', ''), p.get('sessions') or []),
         'boundSessions': p.get('sessions') or [],
     }
@@ -120,6 +121,8 @@ def snapshot():
         'projects': projects,
         'history': history,
         'nodes': nodes_view(),
+        'approvals': [x for x in P.load_approvals().get('items', []) if x.get('status') == 'pending'],
+        'decisions': decisions_view(10),
     }
 
 
@@ -616,6 +619,41 @@ def bind_session(payload):
     return snapshot()
 
 
+def set_autonomy(project, mode, max_per_day=None):
+    if mode not in ('off', 'assist', 'auto'):
+        raise ValueError('mode 只能是 off / assist / auto')
+    reg = P.load_json(P.REGISTRY, {'projects': []})
+    proj = next((x for x in reg['projects'] if x['id'] == project), None)
+    if not proj:
+        raise ValueError('项目不存在')
+    a = P.autonomy_of(proj)
+    a['mode'] = mode
+    if max_per_day is not None:
+        a['maxPerDay'] = int(max_per_day)
+    proj['autonomy'] = a
+    P.save_json(P.REGISTRY, reg)
+    P.log(f'[panel] autonomy {project} -> {mode}')
+    return snapshot()
+
+
+def resolve_approval(approval_id, action, choice=''):
+    it = P.resolve_approval(approval_id, action, choice)
+    if not it:
+        raise ValueError('待批项不存在或已处理')
+    return {'item': it, 'state': snapshot()}
+
+
+def decisions_view(limit=20):
+    rows = []
+    if os.path.exists(P.DECISIONS):
+        for line in open(P.DECISIONS):
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows[-limit:][::-1]
+
+
 def ignore_candidate(path, days):
     if not path:
         raise ValueError('缺少 path')
@@ -764,6 +802,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not proj:
                 return self._json({'ok': False, 'error': '项目不存在'}, 404)
             return self._json({'ok': True, 'id': pid, 'sessions': project_sessions(proj.get('root', ''), 20)})
+        if path == '/api/decisions':
+            return self._json({'ok': True, 'decisions': decisions_view(30)})
+        if path == '/api/approvals':
+            return self._json({'ok': True, 'items': [x for x in P.load_approvals().get('items', []) if x.get('status') == 'pending']})
         if path == '/api/nodes':
             return self._json({'ok': True, 'nodes': nodes_view()})
         if path == '/api/node/scanner.ps1':
@@ -850,6 +892,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({'ok': False, 'error': '请求体不是合法 JSON'}, 400)
 
         try:
+            if path == '/api/autonomy':
+                return self._json({'ok': True, 'state': set_autonomy(payload.get('project'), payload.get('mode'), payload.get('maxPerDay'))})
+            if path == '/api/approval':
+                return self._json({'ok': True, **resolve_approval(payload.get('id'), payload.get('action'), payload.get('choice') or '')})
             if path == '/api/scan/ignore':
                 return self._json({'ok': True, **ignore_candidate(payload.get('path'), payload.get('days', 7))})
             if path == '/api/bind':

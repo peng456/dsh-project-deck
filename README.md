@@ -78,6 +78,18 @@ deck demo                 # 演示环境
 | `schedule.quiet` | 00:30–06:30 | 安静时段，不播报不扫描 |
 | `panel.allowLanRead` | true | 允许手机通过局域网看面板（只读） |
 
+## 自主推进（可选）
+
+每个项目可设 `off` / `assist` / `auto`：`assist` 只给选项和推荐，`auto` 会自己查事实、自己选方案、做可逆的事，把 push/删除/发布这类不可逆动作放进审批队列等你一句话。
+
+```bash
+deck autonomy my-app auto
+deck approvals            # 等你拍板
+deck decisions            # 我替你做过的决定
+```
+
+规则写在 [docs/AUTONOMY.md](docs/AUTONOMY.md)。
+
 ## 多机扫描
 
 节点只读上报，不传文件内容：
