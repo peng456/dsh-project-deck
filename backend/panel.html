@@ -155,6 +155,13 @@
     </label>
     <label>每 <input type="number" id="interval" min="0.1" max="720" step="0.5" style="width:78px"> 小时播报一次</label>
     <button onclick="applyInterval()">应用</button>
+    <label style="margin-left:6px">图标位置
+      <select onchange="setFabPos(this.value)" style="padding:5px 8px">
+        <option value="">默认</option><option value="right-bottom">右下</option>
+        <option value="left-bottom">左下</option><option value="right-top">右上</option>
+        <option value="center-right">右侧居中</option>
+      </select>
+    </label>
     <label style="margin-left:6px">版式
       <select id="format" onchange="setConfig({format:this.value})" style="padding:5px 8px">
         <option value="markdown">Markdown</option>
@@ -572,6 +579,13 @@ function sendToPlugin(payload){
       }
     }, 2500),
   };
+}
+
+function setFabPos(pos){
+  if (!inPluginFrame()) { toast('请在 DSH 内嵌面板里使用（浏览器打开时无效）', true); return; }
+  window.parent.postMessage({ type: 'deck:set-fab-pos', pos }, '*');
+  if (!pos) { toast('已重置为默认位置'); return; }
+  toast('图标位置已切换');
 }
 
 function openDeepLink(hash){
