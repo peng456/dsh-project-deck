@@ -1,0 +1,39 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'optional: npm version to publish (defaults to package.json)'
+        required: false
+
+permissions:
+  contents: read
+  id-token: write   # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Syntax checks
+        run: |
+          node --check lib/index.js
+          node --check lib/client.js
+          python3 -c "compile(open('backend/deck').read(),'deck','exec')"
+          python3 -m py_compile backend/panel.py
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
