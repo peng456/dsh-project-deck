@@ -625,9 +625,6 @@ async function refreshWechat(){
   try{
     const r = await fetch('/api/wechat'); const j = await r.json();
     WX = j.wechat || {};
-    const dot = $('wxDot'); const title = $('wxTitle');
-    if (dot) dot.className = 'dot ' + (WX.ok ? 'ok' : 'bad');
-    if (title) title.textContent = WX.mode === 'ilink' ? '微信' : (WX.mode || '通知');
     const shortWx = WX.mode === 'ilink'
       ? (WX.logged ? (WX.bot ? '已连接 · ' + WX.bot : '已连接') : '未连接')
       : (WX.ok ? '已接通' : '未接通');
