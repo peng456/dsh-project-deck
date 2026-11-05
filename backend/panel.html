@@ -357,7 +357,11 @@ function render(){
   const banner = $('wxBanner');
   if (banner) {
     banner.style.display = wxStale ? 'block' : 'none';
-    if (wxStale) banner.innerHTML = '⚠️ 微信通道 context_token 已过期：这段时间的播报<b>不会排队堆积</b>。在微信里给 bot 发任意一句话，下一轮播报自动恢复。';
+    if (wxStale) {
+      banner.innerHTML = (WX && WX.mode === 'ilink')
+        ? '⚠️ 微信还没连接：点下面「连接微信」扫码，<b>扫码后还要在微信里给 bot 发一句话</b>，之后播报就能推送到微信。'
+        : '⚠️ 微信通道 context_token 已过期：这段时间的播报<b>不会排队堆积</b>。在微信里给 bot 发任意一句话，下一轮播报自动恢复。';
+    }
   }
   $('nextText').textContent = S.daemon.nextRun ? shortTime(S.daemon.nextRun) : '—';
 

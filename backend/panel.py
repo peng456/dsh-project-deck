@@ -47,6 +47,16 @@ P = load_deck()
 
 
 # ── 数据汇总 ────────────────────────────────────────────────
+def channel_stale_now():
+    d = P.delivery_cfg()
+    if d['type'] == 'ilink':
+        w = P.wechat_status()
+        return not (w['logged'] and w['hasContext'])
+    if d['type'] == 'wxpush':
+        return P.channel_stale()
+    return not P.delivery_status().get('ok')
+
+
 def wechat_view():
     d = P.delivery_cfg()
     if d['type'] == 'ilink':
@@ -127,7 +137,7 @@ def snapshot():
         'daemon': {'running': bool(P.daemon_status()), 'pid': P.daemon_status() or 0,
                    'lastRun': last, 'nextRun': (last + interval * 3600) if last else 0},
         'wechat': dict(wechat_state(),
-                       stale=P.channel_stale(),
+                       stale=channel_stale_now(),
                        fails=P.channel_state().get('fails', 0),
                        lastError=P.channel_state().get('lastError', '')),
         'counts': {
