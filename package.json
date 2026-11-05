@@ -44,7 +44,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/peng456/dsh-project-deck"
+    "url": "git+https://github.com/peng456/dsh-project-deck.git"
   },
   "author": "peng456",
   "homepage": "https://github.com/peng456/dsh-project-deck#readme",

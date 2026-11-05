@@ -33,6 +33,9 @@ jobs:
           python3 -c "compile(open('backend/deck').read(),'deck','exec')"
           python3 -m py_compile backend/panel.py
 
+      - name: Use npm 11 (trusted publishing / OIDC support)
+        run: npm install -g npm@11
+
       - name: Publish
         run: npm publish --access public --provenance
         env:
