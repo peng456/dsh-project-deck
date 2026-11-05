@@ -41,5 +41,3 @@ jobs:
       # 如果配置了 NPM_TOKEN secret，setup-node 的 .npmrc 会带它，同样可用。
       - name: Publish
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
