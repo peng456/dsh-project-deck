@@ -18,8 +18,8 @@ jobs:
           python-version: "3.12"
       - name: Syntax check (backend)
         run: |
-          python -c "compile(open('backend/pagent').read(),'pagent','exec')"
+          python -c "compile(open('backend/deck').read(),'pagent','exec')"
           python -m py_compile backend/panel.py
-          python -c "compile(open('backend/pagent-node').read(),'pagent-node','exec')"
+          python -c "compile(open('backend/deck-node').read(),'pagent-node','exec')"
       - name: Shell check
         run: bash -n install.sh
