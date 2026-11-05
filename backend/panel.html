@@ -621,8 +621,7 @@ async function refreshWechat(){
     const needQr = WX.mode === 'ilink' && !WX.logged && WX.qrUrl;
     $('wxQrWrap').style.display = needQr ? 'block' : 'none';
     if (needQr) $('wxQr').src = '/api/wechat/qr.png?t=' + Date.now();
-    $('wxLoginBtn').style.display = (WX.mode === 'ilink' && !WX.logged) ? '' : 'none';
-    $('wxLogoutBtn').style.display = (WX.mode === 'ilink' && WX.logged) ? '' : 'none';
+    updateWxButtons();
     if (WX.mode === 'ilink' && !WX.ok) {
       if (!wxTimer) wxTimer = setInterval(refreshWechat, 2500);
     } else if (wxTimer) { clearInterval(wxTimer); wxTimer = null; }
@@ -641,6 +640,13 @@ const WX_FIELD = {
   ilink: null,
 };
 
+function updateWxButtons(){
+  const type = $('wxType') ? $('wxType').value : 'wxpush';
+  const logged = !!(WX && WX.logged);
+  $('wxLoginBtn').style.display = (type === 'ilink' && !logged) ? '' : 'none';
+  $('wxLogoutBtn').style.display = (type === 'ilink' && logged) ? '' : 'none';
+}
+
 function onWxTypeChange(){
   const type = $('wxType').value;
   const f = WX_FIELD[type];
@@ -651,20 +657,23 @@ function onWxTypeChange(){
     $('wxField').placeholder = f[1];
     $('wxField').value = cur[f[0]] || '';
   }
-  const isIlink = type === 'ilink';
-  $('wxLoginBtn').style.display = isIlink ? '' : 'none';
-  $('wxLogoutBtn').style.display = 'none';
+  // 内置微信没有额外参数：下拉即切换并落盘，随后出现「连接微信」
+  if (!f) applyDelivery({ type });
+}
+
+async function applyDelivery(delivery){
+  try{
+    const r = await api('/api/config', { delivery });
+    S = r.state; render(); refreshWechat();
+    toast('通知渠道 → ' + delivery.type);
+  }catch(e){ toast('切换失败：' + e.message, true); }
 }
 
 async function saveWx(){
   const type = $('wxType').value;
   const f = WX_FIELD[type];
   if (!f) return;
-  const delivery = { type, [f[0]]: $('wxField').value.trim() };
-  try{
-    const r = await api('/api/config', { delivery });
-    S = r.state; render(); refreshWechat(); toast('通知渠道已更新');
-  }catch(e){ toast('保存失败：' + e.message, true); }
+  await applyDelivery({ type, [f[0]]: $('wxField').value.trim() });
 }
 
 function setFabPos(pos){
@@ -932,6 +941,7 @@ refresh().then(() => {
   const h = location.hash;
   if (h.startsWith('#p=')) openDetail(decodeURIComponent(h.slice(3)));
 });
+refreshWechat();
 loadScan();
 loadImages();
 setInterval(tick, 1000);
