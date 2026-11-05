@@ -184,20 +184,20 @@
     <div class="hint" id="imgHint" style="margin-top:6px"></div>
   </div>
 
-  <div class="controls" id="wxBox" style="padding:10px 12px">
-    <span class="pill" style="margin:0"><i class="dot" id="wxDot"></i><b id="wxTitle">通知渠道</b></span>
-    <select id="wxType" onchange="onWxTypeChange()" style="font-size:12px;padding:5px 8px">
+  <div class="controls" id="wxBox" style="padding:5px 10px;gap:8px;min-height:0">
+    <i class="dot" id="wxDot"></i><b id="wxTitle" style="font-size:12px;color:var(--muted);font-weight:600">通知</b>
+    <select id="wxType" onchange="onWxTypeChange()" style="font-size:12px;padding:3px 6px;height:26px">
       <option value="ilink">内置微信（扫码）</option>
       <option value="wxpush">wxpush 网关</option>
       <option value="serverchan">ServerChan</option>
       <option value="webhook">Webhook</option>
       <option value="command">自定义命令</option>
     </select>
-    <input id="wxField" placeholder="" style="flex:1;min-width:160px;display:none">
-    <button class="ghost" id="wxSaveBtn" onclick="saveWx()" style="display:none">保存</button>
-    <span class="hint" id="wxDetail"></span>
-    <button class="ghost" id="wxLoginBtn" onclick="wxLogin()" style="display:none">连接微信</button>
-    <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none">断开</button>
+    <input id="wxField" placeholder="" style="flex:1;min-width:120px;height:26px;padding:3px 8px;font-size:12px;display:none">
+    <button class="ghost" id="wxSaveBtn" onclick="saveWx()" style="display:none;padding:3px 10px;font-size:12px">保存</button>
+    <span class="hint" id="wxDetail" style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px"></span>
+    <button class="ghost" id="wxLoginBtn" onclick="wxLogin()" style="display:none;padding:3px 10px;font-size:12px">连接微信</button>
+    <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none;padding:3px 10px;font-size:12px">断开</button>
   </div>
   <div id="wxQrWrap" style="display:none;margin:-6px 0 18px;display:none">
     <div style="display:flex;gap:14px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px">
@@ -932,6 +932,13 @@ async function loadImages(){
       <div class="hint" style="margin-top:5px">${esc(shortTime(im.at))}</div></div>`).join('');
   }catch(e){ /* 忽略 */ }
 }
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'deck:close' }, '*');
+  }
+});
 
 async function refresh(){
   try{
