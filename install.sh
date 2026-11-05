@@ -18,7 +18,8 @@ if [ ! -f "$BASE/config.json" ]; then
   cat > "$BASE/config.json" <<JSON
 {
   "version": 1,
-  "report": { "enabled": true, "intervalHours": 4, "format": "markdown", "image": true, "maxChars": 1200 },
+  "report": { "enabled": true, "intervalHours": 4, "format": "markdown", "image": false, "maxChars": 1200,
+              "delivery": { "type": "wxpush", "url": "http://127.0.0.1:9098" } },
   "scan": { "enabled": true, "autoAdd": true, "intervalHours": 12, "threshold": 70, "depth": 1,
             "roots": ["~/Desktop", "~"] },
   "schedule": { "quiet": { "from": "00:30", "to": "06:30" } },

@@ -48,12 +48,10 @@ P = load_deck()
 
 # ── 数据汇总 ────────────────────────────────────────────────
 def wechat_state():
-    try:
-        r = subprocess.run([P.WXSEND, '--status'], capture_output=True, text=True, timeout=10)
-        ok = r.returncode == 0
-        return {'ok': ok, 'raw': r.stdout.strip(), 'code': r.returncode}
-    except (OSError, subprocess.SubprocessError):
-        return {'ok': False, 'raw': 'wxsend 不可用', 'code': 3}
+    st = P.delivery_status()
+    return {'ok': bool(st.get('ok')), 'raw': st.get('detail', ''),
+            'code': 0 if st.get('ok') else 2, 'type': st.get('type'),
+            'pending': st.get('pending', 0)}
 
 
 def project_view(p):

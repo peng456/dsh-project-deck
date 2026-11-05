@@ -1017,6 +1017,97 @@ def cmd_scan(argv):
 
 
 # ── 发送 ────────────────────────────────────────────────────
+def delivery_cfg(cfg=None):
+    cfg = cfg or load_json(CONFIG, {})
+    d = (cfg.get('report') or {}).get('delivery') or {}
+    return {
+        'type': (d.get('type') or 'wxpush').lower(),
+        'url': (d.get('url') or 'http://127.0.0.1:9098').rstrip('/'),
+        'key': d.get('key') or '',
+        'webhook': d.get('webhook') or '',
+        'command': d.get('command') or '',
+    }
+
+
+def _http_json(url, payload, timeout=20, headers=None):
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    req = urllib.request.Request(url, data=body,
+                                 headers={'Content-Type': 'application/json', **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, json.loads(r.read().decode() or '{}')
+
+
+def delivery_send(text):
+    """按 report.delivery.type 发送一条文本。返回 (0|2|3, 说明)。"""
+    d = delivery_cfg()
+    t = d['type']
+    try:
+        if t == 'wxpush':
+            if not d['url']:
+                return 3, 'wxpush url 未配置'
+            code, body = _http_json(d['url'] + '/send', {'message': text})
+            if code == 200:
+                return 0, '已送达（wxpush）'
+            if code == 202:
+                return 2, '已入队（wxpush 未接通）'
+            return 3, f'wxpush HTTP {code}'
+        if t == 'serverchan':
+            if not d['key']:
+                return 2, 'ServerChan key 未配置'
+            url = f"https://sctapi.ftqq.com/{d['key']}.send"
+            import urllib.parse
+            data = urllib.parse.urlencode({'title': '项目播报', 'desp': text}).encode()
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                j = json.loads(r.read().decode() or '{}')
+            if j.get('code') in (0, '0'):
+                return 0, '已送达（ServerChan）'
+            return 3, f"ServerChan 返回 {str(j)[:120]}"
+        if t == 'webhook':
+            if not d['webhook']:
+                return 2, 'webhook 未配置'
+            code, body = _http_json(d['webhook'], {
+                'msgtype': 'text', 'text': {'content': text}, 'message': text})
+            return (0, '已送达（webhook）') if code in (200, 204) else (3, f'webhook HTTP {code}')
+        if t == 'command':
+            if not d['command']:
+                return 2, 'command 未配置'
+            r = subprocess.run(d['command'], shell=True, input=text, capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                return 0, '已送达（command）'
+            return 3, f"command 退出码 {r.returncode}: {(r.stderr or r.stdout)[:120]}"
+        return 3, f'未知 delivery.type: {t}'
+    except Exception as e:
+        return 3, f'{t} 发送失败: {e}'
+
+
+def delivery_status():
+    """给面板/status 用：返回 {ok, stale, detail, pending}。"""
+    d = delivery_cfg()
+    out = {'type': d['type'], 'ok': False, 'detail': '', 'pending': 0}
+    try:
+        if d['type'] == 'wxpush':
+            with urllib.request.urlopen(d['url'] + '/health', timeout=5) as r:
+                j = json.loads(r.read().decode() or '{}')
+            out['ok'] = bool(j.get('ready') or j.get('authorized'))
+            out['pending'] = int((j.get('outbox') or {}).get('pending') or 0)
+            out['detail'] = 'wxpush 已接通' if out['ok'] else ('wxpush 未接通：需要扫码授权或给 bot 发消息刷新')
+            if j.get('token_dead'):
+                out['detail'] = 'wxpush 登录态已失效：需要重新扫码'
+        elif d['type'] == 'serverchan':
+            out['ok'] = bool(d['key'])
+            out['detail'] = 'ServerChan 已配置' if out['ok'] else 'ServerChan key 未配置'
+        elif d['type'] == 'webhook':
+            out['ok'] = bool(d['webhook'])
+            out['detail'] = 'webhook 已配置' if out['ok'] else 'webhook 未配置'
+        elif d['type'] == 'command':
+            out['ok'] = bool(d['command'])
+            out['detail'] = f"command: {d['command']}" if out['ok'] else 'command 未配置'
+    except Exception as e:
+        out['detail'] = f'{d["type"]} 不可达: {e}'
+    return out
+
+
 def channel_state():
     return load_json(CHANNEL_STATE, {'stale': False, 'fails': 0})
 
@@ -1054,15 +1145,12 @@ def mark_channel(ok, err=''):
 
 
 def send_wechat(text):
-    if not os.path.exists(WXSEND):
-        return 3, 'wxsend 不存在'
-    r = subprocess.run([WXSEND], input=text, capture_output=True, text=True, timeout=30)
-    msg = (r.stdout or r.stderr).strip()
-    if r.returncode == 0:
+    code, msg = delivery_send(text)
+    if code == 0:
         mark_channel(True)
-    elif r.returncode == 2:
-        mark_channel(False, msg.splitlines()[0] if msg else 'queued')
-    return r.returncode, msg
+    elif code == 2:
+        mark_channel(False, msg[:120])
+    return code, msg
 
 
 def refresh_local_node(cfg=None):
@@ -1132,6 +1220,8 @@ def do_report_with_image(cfg, quiet=False, force=None):
     """播报（文字）+ 可选附图；force=True/False 覆盖 config，None 跟随 config。"""
     code, text, msg = do_report(cfg, quiet)
     want = cfg.get('report', {}).get('image') if force is None else force
+    if delivery_cfg(cfg)['type'] != 'wxpush':
+        want = False
     if code == 0 and want:
         try:
             png = render_image(cfg)
@@ -1202,6 +1292,8 @@ def queue_image(png_path, caption=None):
 def flush_pending_image():
     p = load_json(PENDING_IMG, None)
     if not p:
+        return False
+    if delivery_cfg()['type'] != 'wxpush':
         return False
     if channel_stale():
         return False
@@ -1597,7 +1689,8 @@ def cmd_status():
         nxt += 1800
     print(f"下次播报: {datetime.fromtimestamp(nxt):%Y-%m-%d %H:%M}")
     wx = subprocess.run([WXSEND, '--status'], capture_output=True, text=True)
-    print('微信通道: ' + ('✅ 可发送' if wx.returncode == 0 else '⚠️ 未接通（播报会排队，授权后补发）'))
+    st = delivery_status()
+    print(f"通知渠道: {st['type']} · " + ('✅ ' if st['ok'] else '⚠️ ') + st['detail'])
     return 0 if pid else 1
 
 

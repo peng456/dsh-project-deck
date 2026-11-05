@@ -67,6 +67,33 @@ deck demo                 # 演示环境
 无变化：官网改版、基础设施、…
 ```
 
+## 通知渠道（可选，默认 wxpush）
+
+播报通过 `report.delivery` 选择发送器，**不带任何内置账号**：
+
+```jsonc
+"report": {
+  "enabled": true,
+  "image": false,                          // 附图仅 wxpush 通道支持
+  "delivery": {
+    "type": "wxpush",                      // wxpush | serverchan | webhook | command
+    "url": "http://127.0.0.1:9098",        // wxpush
+    "key": "",                             // ServerChan SendKey
+    "webhook": "",                         // 任意 webhook（企业微信机器人等）
+    "command": ""                          // 自写脚本：stdin 收文本，退出码 0 = 成功
+  }
+}
+```
+
+| 类型 | 依赖 | 说明 |
+|---|---|---|
+| `wxpush` | 本机 wxpush 服务 | 支持文字 + 看板图；token 过期时会入队等恢复 |
+| `serverchan` | ServerChan SendKey | 纯 HTTP，无 token 过期问题 |
+| `webhook` | 任意 URL | 发 `{"msgtype":"text","text":{"content":...}}`，兼容企业微信机器人 |
+| `command` | 你的脚本 | 最灵活，退出码判定 |
+
+`deck status` 会显示当前通道与连通状态；通道不通时播报不会堆积（附图除外，会有限重试）。
+
 ## 配置（`~/.project-deck/config.json`）
 
 | key | 默认 | 说明 |
